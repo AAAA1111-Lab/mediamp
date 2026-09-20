@@ -156,7 +156,7 @@ kotlinMultiplatformExtension?.apply {
     }
 
     if (composeExtension != null && enableJvmTarget) {
-        sourceSets.getByName("desktopMain").dependencies {
+        sourceSets.getByName("desktopTest").dependencies {
             implementation(libs.getLibrary("compose-ui-test-junit4"))
         }
     }
