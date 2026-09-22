@@ -26,6 +26,63 @@ package org.openani.mediamp.exoplayer.internal
 internal object FlacStreamInfo {
     const val SIZE = 34
 
+    /**
+     * Extracts the STREAMINFO body the decoder needs out of whatever the extractor reported.
+     *
+     * The shapes that actually reach a decoder differ more than the format description suggests,
+     * and getting this wrong fails playback: on a real 24-bit Matroska release the codec private
+     * was **42** bytes (metadata block header + STREAMINFO) and another stream reported 113 bytes
+     * (STREAMINFO plus a seek table), while Media3's FlacExtractor hands over the bare 34 bytes.
+     * So the metadata block chain is parsed rather than a fixed size assumed:
+     *
+     *   [0..3]   optional "fLaC" signature
+     *   then, repeatedly: 1 byte block header (last-block flag + 7-bit type), 3-byte length, body
+     *
+     * Returns the 34-byte STREAMINFO body, or null when [data] does not contain one.
+     */
+    fun extractStreamInfo(data: ByteArray): ByteArray? {
+        var offset = 0
+        if (data.size >= 4 &&
+            data[0] == 'f'.code.toByte() &&
+            data[1] == 'L'.code.toByte() &&
+            data[2] == 'a'.code.toByte() &&
+            data[3] == 'C'.code.toByte()
+        ) {
+            offset = 4
+        }
+
+        // A bare body: exactly the 34 bytes with no block header in front of them.
+        if (data.size == SIZE) {
+            return data.copyOf()
+        }
+
+        while (offset + 4 <= data.size) {
+            val header = data[offset].toInt() and 0xFF
+            val isLast = (header and 0x80) != 0
+            val type = header and 0x7F
+            val length = ((data[offset + 1].toInt() and 0xFF) shl 16) or
+                ((data[offset + 2].toInt() and 0xFF) shl 8) or
+                (data[offset + 3].toInt() and 0xFF)
+            val bodyStart = offset + 4
+            if (bodyStart + length > data.size) {
+                return null
+            }
+            if (type == BLOCK_TYPE_STREAMINFO) {
+                if (length < SIZE) {
+                    return null
+                }
+                return data.copyOfRange(bodyStart, bodyStart + SIZE)
+            }
+            if (isLast) {
+                return null
+            }
+            offset = bodyStart + length
+        }
+        return null
+    }
+
+    private const val BLOCK_TYPE_STREAMINFO = 0
+
     fun pack(
         sampleRate: Int,
         channelCount: Int,

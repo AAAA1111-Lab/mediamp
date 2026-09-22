@@ -9,22 +9,23 @@
 /**
  * On-device probe for the FLAC software decoder.
  *
- * Playback failures can only be attributed from a real device, and the app path is slow to
- * iterate on: it needs a rebuild, an install and UI driving. This executable drives the exact
- * same decode entry point the renderer uses (mediamp_flac::decodeFrame) over a FLAC file read
- * from disk and reports where decoding stops being correct:
+ * Playback failures can only be attributed from a real device, and iterating through the app needs
+ * a rebuild, an install and UI driving. This executable drives the same decode entry point the
+ * renderer uses (mediamp_flac::decodeFrame) over a FLAC file read from disk, but it reproduces the
+ * *streaming* shape of the real decoder rather than reading whole frames from the file:
  *
- *   1. whether dr_flac can open the file as one stream (rules the library itself out),
- *   2. whether the STREAMINFO the extractor would hand over parses into sane fields,
- *   3. whether frames decode when cut at real frame boundaries (parsed from each frame header,
- *      not by scanning for the sync code, which also occurs inside compressed subframes), and
- *   4. how the decoder copes with a buffer that holds more than one frame, since Media3's
- *      Decoder contract is fed one container sample at a time and that sample is not guaranteed
- *      to be a single frame.
+ *   1. it splits the byte stream into container-sized chunks (the measured average Matroska block
+ *      size by default), which is what Media3 hands the decoder, and
+ *   2. it reassembles frames from those chunks using the same rules as
+ *      FlacFrameAccumulator: a header is recognised by the sync code plus its CRC-8, and a frame
+ *      ends where the next valid header begins.
+ *
+ * That makes it a real check of the reassembly logic, which is where 24-bit FLAC failed: the
+ * blocks are neither frame aligned nor one frame per block.
  *
  * Not part of the shipped native libraries; see registerFlacProbeExecutable.
  *
- * Usage: flac_probe <file.flac> [maxFrames]
+ * Usage: flac_probe <file.flac> [chunkBytes] [maxFrames]
  */
 
 #include <cstdint>
@@ -40,6 +41,11 @@
 namespace {
 
 constexpr size_t kStreamInfoSize = 34;
+constexpr size_t kMinHeaderSize = 6;
+constexpr size_t kMaxHeaderSize = 16;
+
+const uint8_t *g_file = nullptr;
+size_t g_fileSize = 0;
 
 std::vector<uint8_t> readFile(const char *path) {
     std::vector<uint8_t> data;
@@ -62,118 +68,69 @@ std::vector<uint8_t> readFile(const char *path) {
     return data;
 }
 
-/** True when `bytes` starts with a FLAC frame sync code: 14 bits set followed by the reserved 0. */
-bool isFrameSync(const uint8_t *bytes) {
+bool isHeaderStart(const uint8_t *bytes) {
     return bytes[0] == 0xFF && (bytes[1] & 0xFE) == 0xF8;
 }
 
-struct FrameHeader {
-    /** Bytes of the header, i.e. where the subframes start. */
-    size_t headerSize = 0;
-    /** PCM frames per subframe, from the block size code (0 when stored in the header). */
-    uint32_t blockSize = 0;
-    bool valid = false;
-};
-
-/**
- * Parses the parts of a frame header needed to walk the stream (RFC 9639 §9.1).
- *
- * Walking by sync-code scanning is wrong: the sync bytes also occur inside a frame's compressed
- * subframes, so a scan finds false boundaries and truncates frames. Parsing the header gives the
- * exact end of the header; combined with the next header's position that yields the frame size,
- * and the block size code gives the sample count to verify the walk against.
- */
-FrameHeader parseFrameHeader(const uint8_t *frame, size_t available) {
-    FrameHeader result{};
-    if (available < 6 || !isFrameSync(frame)) {
-        return result;
+int crc8(const uint8_t *bytes, size_t count) {
+    int crc = 0;
+    for (size_t index = 0; index < count; ++index) {
+        crc ^= bytes[index];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80) != 0 ? ((crc << 1) ^ 0x07) & 0xFF : (crc << 1) & 0xFF;
+        }
     }
-    const int blockSizeCode = frame[2] >> 4;
-    const int sampleRateCode = frame[2] & 0x0F;
+    return crc;
+}
 
-    size_t offset = 4;
-    // UTF-8 coded frame number (fixed block size) or sample number (variable block size).
-    const uint8_t firstByte = frame[offset++];
-    if ((firstByte & 0x80) != 0) {
+size_t headerSizeIgnoringCrc(const uint8_t *bytes, size_t available) {
+    if (available < kMinHeaderSize || !isHeaderStart(bytes)) {
+        return 0;
+    }
+    const int blockSizeCode = bytes[2] >> 4;
+    const int sampleRateCode = bytes[2] & 0x0F;
+    if (blockSizeCode == 0x0) {
+        return 0;
+    }
+    size_t cursor = 4;
+    const uint8_t first = bytes[cursor++];
+    if ((first & 0x80) != 0) {
         for (int bit = 6; bit >= 0; --bit) {
-            if ((firstByte & (1 << bit)) != 0) {
-                ++offset;
+            if ((first & (1 << bit)) != 0) {
+                ++cursor;
             } else {
                 break;
             }
         }
     }
-
-    switch (blockSizeCode) {
-        case 0x1: result.blockSize = 192; break;
-        case 0x2: result.blockSize = 576; break;
-        case 0x3: result.blockSize = 1152; break;
-        case 0x4: result.blockSize = 2304; break;
-        case 0x5: result.blockSize = 4608; break;
-        case 0x6:
-            if (offset + 1 > available) return result;
-            result.blockSize = static_cast<uint32_t>(frame[offset]) + 1;
-            offset += 1;
-            break;
-        case 0x7:
-            if (offset + 2 > available) return result;
-            result.blockSize =
-                ((static_cast<uint32_t>(frame[offset]) << 8) | frame[offset + 1]) + 1;
-            offset += 2;
-            break;
-        case 0x8: result.blockSize = 256; break;
-        case 0x9: result.blockSize = 512; break;
-        case 0xA: result.blockSize = 1024; break;
-        case 0xB: result.blockSize = 2048; break;
-        case 0xC: result.blockSize = 4096; break;
-        case 0xD: result.blockSize = 8192; break;
-        case 0xE: result.blockSize = 16384; break;
-        case 0xF: result.blockSize = 32768; break;
-        default: return result;  // 0x0 is reserved
-    }
-
-    switch (sampleRateCode) {
-        case 0xC:
-            if (offset + 1 > available) return result;
-            offset += 1;
-            break;
-        case 0xD:
-        case 0xE:
-            if (offset + 2 > available) return result;
-            offset += 2;
-            break;
-        default:
-            break;
-    }
-
-    // CRC-8 of everything before it.
-    if (offset + 1 > available) {
-        return result;
-    }
-    offset += 1;
-
-    result.headerSize = offset;
-    result.valid = true;
-    return result;
+    if (cursor > kMaxHeaderSize) return 0;
+    if (blockSizeCode == 0x6) cursor += 1;
+    if (blockSizeCode == 0x7) cursor += 2;
+    if (sampleRateCode == 0xC) cursor += 1;
+    if (sampleRateCode == 0xD || sampleRateCode == 0xE) cursor += 2;
+    cursor += 1;  // header CRC-8
+    if (cursor > kMaxHeaderSize) return 0;
+    return cursor;
 }
 
-/**
- * Locates the STREAMINFO body the extractor would hand to the decoder.
- *
- * A raw `.flac` file carries the signature and the metadata block chain, while the decoder only
- * ever receives the bare 34-byte STREAMINFO body, so the probe has to strip the wrapper to test
- * the same input the renderer gets.
- */
+/** Same validation as FlacFrameAccumulator: the header must carry a matching CRC-8. */
+size_t parseHeaderSize(const uint8_t *bytes, size_t available) {
+    const size_t size = headerSizeIgnoringCrc(bytes, available);
+    if (size == 0 || size > available) {
+        return 0;
+    }
+    if (crc8(bytes, size - 1) != bytes[size - 1]) {
+        return 0;
+    }
+    return size;
+}
+
 bool findStreamInfo(const std::vector<uint8_t> &file, size_t *bodyOffset) {
-    if (file.size() >= 4 && std::memcmp(file.data(), "fLaC", 4) == 0 && file.size() > 8) {
-        // Signature, then the first metadata block header: type 0 is STREAMINFO, length 34.
-        if ((file[4] & 0x7F) != 0) {
-            return false;
-        }
+    if (file.size() > 8 && std::memcmp(file.data(), "fLaC", 4) == 0) {
+        if ((file[4] & 0x7F) != 0) return false;
         *bodyOffset = 8;
         return true;
     }
-    // Already a bare body (what Matroska's A_FLAC codec private holds).
     if (file.size() >= kStreamInfoSize) {
         *bodyOffset = 0;
         return true;
@@ -181,7 +138,6 @@ bool findStreamInfo(const std::vector<uint8_t> &file, size_t *bodyOffset) {
     return false;
 }
 
-/** Byte offset of the first frame, derived from the metadata block chain. */
 size_t firstFrameOffset(const std::vector<uint8_t> &file) {
     size_t offset = 0;
     if (file.size() >= 4 && std::memcmp(file.data(), "fLaC", 4) == 0) {
@@ -192,85 +148,30 @@ size_t firstFrameOffset(const std::vector<uint8_t> &file) {
         const uint32_t length = (static_cast<uint32_t>(file[offset + 1]) << 16) |
             (static_cast<uint32_t>(file[offset + 2]) << 8) | file[offset + 3];
         offset += 4 + static_cast<size_t>(length);
-        if (last) {
-            break;
-        }
-        if (offset > file.size()) {
-            return file.size();
-        }
+        if (last) break;
+        if (offset > file.size()) return file.size();
     }
     return offset;
-}
-
-/**
- * Frame sizes discovered by walking headers: the size of frame `index` is `index + 1` minus
- * `index`, so the walk needs the next header's offset. Returns the offsets of every frame start.
- */
-std::vector<size_t> frameOffsets(const std::vector<uint8_t> &file, size_t first, size_t limit) {
-    std::vector<size_t> offsets;
-    size_t offset = first;
-    while (offset + 6 <= file.size() && offsets.size() < limit) {
-        const FrameHeader header = parseFrameHeader(file.data() + offset, file.size() - offset);
-        if (!header.valid) {
-            break;
-        }
-        offsets.push_back(offset);
-        // The subframe section is at least a few bytes per channel; step past the header and
-        // continue scanning for the next header. False syncs are rejected by requiring a
-        // parsable header, which is far stricter than the two sync bytes alone.
-        size_t candidate = offset + header.headerSize + 2;
-        bool found = false;
-        while (candidate + 6 <= file.size()) {
-            if (isFrameSync(file.data() + candidate) &&
-                parseFrameHeader(file.data() + candidate, file.size() - candidate).valid) {
-                offset = candidate;
-                found = true;
-                break;
-            }
-            ++candidate;
-        }
-        if (!found) {
-            break;
-        }
-    }
-    return offsets;
-}
-
-void hexPreview(const uint8_t *bytes, size_t size, char *out, size_t outSize) {
-    size_t written = 0;
-    for (size_t index = 0; index < size && written + 4 < outSize; ++index) {
-        written += static_cast<size_t>(
-            std::snprintf(out + written, outSize - written, "%02X ", bytes[index]));
-    }
-    out[written] = '\0';
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::printf("usage: flac_probe <file.flac> [maxFrames]\n");
+        std::printf("usage: flac_probe <file.flac> [chunkBytes] [maxFrames]\n");
         return 2;
     }
-    const int maxFrames = argc >= 3 ? std::atoi(argv[2]) : 5;
+    const size_t chunkBytes = argc >= 3 ? static_cast<size_t>(std::atoi(argv[2])) : 10795;
+    const int maxFrames = argc >= 4 ? std::atoi(argv[3]) : 6;
 
     const std::vector<uint8_t> file = readFile(argv[1]);
     if (file.empty()) {
         std::printf("FAIL: empty or unreadable file\n");
         return 2;
     }
-    std::printf("file: %s (%zu bytes)\n", argv[1], file.size());
-
-    const size_t firstFrame = firstFrameOffset(file);
-    std::printf("first frame offset: %zu, first bytes:", firstFrame);
-    for (size_t index = 0; index < 4 && firstFrame + index < file.size(); ++index) {
-        std::printf(" %02X", file[firstFrame + index]);
-    }
-    std::printf("\n");
-    if (firstFrame >= file.size()) {
-        std::printf("FAIL: no frame found\n");
-        return 2;
-    }
+    g_file = file.data();
+    g_fileSize = file.size();
+    std::printf("file: %s (%zu bytes), chunk=%zu bytes\n", argv[1], file.size(), chunkBytes);
 
     size_t streamInfoOffset = 0;
     if (!findStreamInfo(file, &streamInfoOffset)) {
@@ -283,108 +184,129 @@ int main(int argc, char **argv) {
     const mediamp_flac::StreamInfo info =
         mediamp_flac::parseStreamInfo(streamInfo.data(), streamInfo.size());
     std::printf(
-        "stream info: rate=%u channels=%u bits=%u blockSize=%u..%u totalSamples=%llu\n",
+        "stream info: rate=%u channels=%u bits=%u blockSize=%u..%u\n",
         info.sampleRate,
         info.channels,
         info.bitsPerSample,
         info.minBlockSize,
-        info.maxBlockSize,
-        static_cast<unsigned long long>(info.totalSamples));
-    if (info.sampleRate == 0 || info.channels == 0 || info.bitsPerSample == 0) {
-        std::printf("FAIL: stream info did not parse\n");
+        info.maxBlockSize);
+    if (info.sampleRate == 0 || info.channels == 0) {
+        std::printf("FAIL: stream info did not parse (the bug that broke 24-bit)\n");
         return 1;
     }
 
-    // Step 1: can dr_flac open the file as one stream? Rules the library itself out.
-    drflac *whole = drflac_open_memory(file.data(), file.size(), nullptr);
-    if (whole == nullptr) {
-        std::printf("FAIL: dr_flac cannot open the file as one stream\n");
-        return 1;
-    }
-    std::printf(
-        "dr_flac whole-file: rate=%u channels=%u bits=%u\n",
-        whole->sampleRate,
-        whole->channels,
-        whole->bitsPerSample);
-    drflac_close(whole);
+    const size_t frameStart = firstFrameOffset(file);
+    std::printf("first frame offset: %zu\n", frameStart);
 
-    // Step 2: decode frames cut at real boundaries.
     const size_t bytesPerFrame =
         static_cast<size_t>(info.channels) * static_cast<size_t>(sizeof(int32_t));
     std::vector<uint8_t> output(static_cast<size_t>(info.maxBlockSize) * bytesPerFrame * 4);
 
-    const std::vector<size_t> offsets = frameOffsets(file, firstFrame, maxFrames + 1);
-    std::printf("frame starts found: %zu\n", offsets.size());
-    int decoded = 0;
-    int failed = 0;
-    for (size_t index = 0; index + 1 <= offsets.size() && index < static_cast<size_t>(maxFrames);
-         ++index) {
-        const size_t start = offsets[index];
-        if (index + 1 >= offsets.size()) {
-            break;
-        }
-        const size_t size = offsets[index + 1] - start;
-        const FrameHeader header = parseFrameHeader(file.data() + start, file.size() - start);
-        int32_t pcmFrames = 0;
-        const mediamp_flac::DecodeStatus status = mediamp_flac::decodeFrame(
-            streamInfo.data(),
-            streamInfo.size(),
-            file.data() + start,
-            size,
-            output.data(),
-            output.size(),
-            &pcmFrames);
-        if (status == mediamp_flac::DecodeStatus::Ok) {
-            ++decoded;
-            std::printf(
-                "frame %zu: offset=%zu size=%zu blockSize=%u -> %d PCM frames%s\n",
-                index,
-                start,
-                size,
-                header.blockSize,
-                pcmFrames,
-                pcmFrames == static_cast<int32_t>(header.blockSize) ? "" : "  <- MISMATCH");
-        } else {
-            ++failed;
-            char preview[64];
-            hexPreview(file.data() + start, 8, preview, sizeof(preview));
-            std::printf(
-                "frame %zu: offset=%zu size=%zu blockSize=%u -> FAILED: %s (head: %s)\n",
-                index,
-                start,
-                size,
-                header.blockSize,
-                mediamp_flac::describe(status),
-                preview);
-        }
-    }
-    std::printf("single-frame results: %d ok, %d failed\n", decoded, failed);
+    // Walk the stream exactly as the decoder does: append container-sized chunks, emit whole
+    // frames, keep the tail.
+    std::vector<uint8_t> pending;
+    size_t offset = frameStart;
+    int decodedFrames = 0;
+    int emitted = 0;
+    long long totalPcmFrames = 0;
+    int frameIndex = 0;
 
-    // Step 3: what if a container sample carries several frames at once? Media3 does not promise
-    // one frame per sample, so the decoder has to cope with this shape too.
-    if (offsets.size() >= 3 && decoded > 0) {
-        const size_t multiStart = offsets[0];
-        const size_t multiSize = offsets[2] - multiStart;
-        int32_t pcmFrames = 0;
-        const mediamp_flac::DecodeStatus status = mediamp_flac::decodeFrame(
-            streamInfo.data(),
-            streamInfo.size(),
-            file.data() + multiStart,
-            multiSize,
-            output.data(),
-            output.size(),
-            &pcmFrames);
-        std::printf(
-            "two-frames-in-one-buffer: size=%zu -> %s (%d PCM frames)\n",
-            multiSize,
-            mediamp_flac::describe(status),
-            pcmFrames);
-    }
+    auto drain = [&](bool endOfInput) {
+        while (true) {
+            if (pending.size() < kMinHeaderSize) {
+                return;
+            }
+            if (parseHeaderSize(pending.data(), pending.size()) == 0) {
+                // Realign on the next plausible header, as the accumulator does after a seek.
+                size_t start = static_cast<size_t>(-1);
+                for (size_t probe = 0; probe + kMinHeaderSize <= pending.size(); ++probe) {
+                    if (isHeaderStart(pending.data() + probe) &&
+                        parseHeaderSize(pending.data() + probe, pending.size() - probe) != 0) {
+                        start = probe;
+                        break;
+                    }
+                }
+                if (start == static_cast<size_t>(-1)) {
+                    return;
+                }
+                pending.erase(pending.begin(), pending.begin() + static_cast<long>(start));
+                continue;
+            }
+            const size_t headerSize = parseHeaderSize(pending.data(), pending.size());
+            size_t frameLength = 0;
+            for (size_t candidate = headerSize + 1;
+                 candidate + kMinHeaderSize <= pending.size();
+                 ++candidate) {
+                if (isHeaderStart(pending.data() + candidate) &&
+                    parseHeaderSize(pending.data() + candidate, pending.size() - candidate) != 0) {
+                    frameLength = candidate;
+                    break;
+                }
+            }
+            if (frameLength == 0) {
+                if (endOfInput) {
+                    frameLength = pending.size();
+                } else {
+                    return;
+                }
+            }
+            if (emitted >= maxFrames) {
+                return;
+            }
+            int32_t pcmFrames = 0;
+            const mediamp_flac::DecodeStatus status = mediamp_flac::decodeFrame(
+                streamInfo.data(),
+                streamInfo.size(),
+                pending.data(),
+                frameLength,
+                output.data(),
+                output.size(),
+                &pcmFrames);
+            if (status == mediamp_flac::DecodeStatus::Ok) {
+                ++decodedFrames;
+                totalPcmFrames += pcmFrames;
+                std::printf(
+                    "frame %d: size=%zu -> %d PCM frames (%.1f ms)\n",
+                    frameIndex,
+                    frameLength,
+                    pcmFrames,
+                    1000.0 * pcmFrames / static_cast<double>(info.sampleRate));
+            } else {
+                std::printf(
+                    "frame %d: size=%zu -> FAILED: %s\n",
+                    frameIndex,
+                    frameLength,
+                    mediamp_flac::describe(status));
+            }
+            ++frameIndex;
+            ++emitted;
+            pending.erase(pending.begin(), pending.begin() + static_cast<long>(frameLength));
+        }
+    };
 
-    if (decoded == 0) {
-        std::printf("FAIL: no frame decoded\n");
+    while (offset < file.size()) {
+        const size_t length = std::min(chunkBytes, file.size() - offset);
+        pending.insert(pending.end(), file.begin() + static_cast<long>(offset),
+                       file.begin() + static_cast<long>(offset + length));
+        offset += length;
+        drain(false);
+    }
+    drain(true);
+
+    std::printf(
+        "streaming result: %d/%d frames decoded, %lld PCM frames total, %zu bytes left over\n",
+        decodedFrames,
+        emitted,
+        totalPcmFrames,
+        pending.size());
+    if (decodedFrames == 0) {
+        std::printf("FAIL: nothing decoded\n");
         return 1;
     }
-    std::printf("PASS: %d frame(s) decoded\n", decoded);
+    if (decodedFrames != emitted) {
+        std::printf("FAIL: %d of %d frames failed\n", emitted - decodedFrames, emitted);
+        return 1;
+    }
+    std::printf("PASS\n");
     return 0;
 }

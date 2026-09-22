@@ -9,7 +9,9 @@
 package org.openani.mediamp.exoplayer.internal
 
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 
 /**
  * Pins the STREAMINFO packing the bundled FLAC decoder depends on.
@@ -74,6 +76,54 @@ class FlacStreamInfoTest {
     @Test
     fun `produces exactly the 34 byte block`() {
         assertEquals(FlacStreamInfo.SIZE, pack().size)
+    }
+
+    @Test
+    fun `accepts a bare 34 byte stream info`() {
+        val body = pack()
+
+        assertContentEquals(body, FlacStreamInfo.extractStreamInfo(body))
+    }
+
+    @Test
+    fun `accepts a stream info preceded by its metadata block header`() {
+        // What a real 24-bit Matroska release reported: 42 bytes of codec private. That is a
+        // metadata block header (last-block flag, type 0, length 34), the body, and a further four
+        // bytes the container carried; the body must be found where the header points.
+        val body = pack(sampleRate = 48000, channelCount = 2, bitsPerSample = 24)
+        val reported = byteArrayOf(0x80.toByte(), 0x00, 0x00, 0x22) + body + byteArrayOf(0, 0, 0, 0)
+
+        assertEquals(42, reported.size)
+        assertContentEquals(body, FlacStreamInfo.extractStreamInfo(reported))
+    }
+
+    @Test
+    fun `accepts a full flac header with extra metadata after stream info`() {
+        // 113 bytes were reported for another stream: a seek table follows the stream info, so the
+        // chain has to be walked rather than a fixed length assumed.
+        val body = pack(sampleRate = 48000, channelCount = 2, bitsPerSample = 24)
+        val seekTableLength = 113 - 4 - FlacStreamInfo.SIZE - 4
+        val header = byteArrayOf(0x00, 0x00, 0x00, FlacStreamInfo.SIZE.toByte()) + body +
+            byteArrayOf(0x83.toByte(), 0x00, 0x00, seekTableLength.toByte()) +
+            ByteArray(seekTableLength)
+
+        assertEquals(113, header.size)
+        assertContentEquals(body, FlacStreamInfo.extractStreamInfo(header))
+    }
+
+    @Test
+    fun `accepts a full flac file header with the signature`() {
+        val body = pack(sampleRate = 48000, channelCount = 2, bitsPerSample = 16)
+        val file = "fLaC".toByteArray() + byteArrayOf(0x80.toByte(), 0x00, 0x00, 0x22) + body
+
+        assertContentEquals(body, FlacStreamInfo.extractStreamInfo(file))
+    }
+
+    @Test
+    fun `rejects a configuration with no stream info`() {
+        assertNull(FlacStreamInfo.extractStreamInfo(byteArrayOf(0x01, 0x02, 0x03)))
+        // A block chain whose only block is not STREAMINFO.
+        assertNull(FlacStreamInfo.extractStreamInfo(byteArrayOf(0x84.toByte(), 0x00, 0x00, 0x02, 0xAA.toByte(), 0xBB.toByte())))
     }
 
     private fun pack(

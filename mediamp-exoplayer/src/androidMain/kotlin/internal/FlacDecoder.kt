@@ -69,8 +69,14 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
      * [FlacDecoderNative] for why that is the only shape that has to be handled.
      */
     fun configure(format: Format, configurationData: ByteArray?) {
-        val data = configurationData
+        val raw = configurationData
             ?: throw FlacDecoderException("FLAC track has no codec configuration (csd-0)")
+        // Extractors report the codec configuration in several shapes (bare STREAMINFO, a block
+        // header plus STREAMINFO, STREAMINFO plus other metadata); see FlacStreamInfo.
+        val data = FlacStreamInfo.extractStreamInfo(raw)
+            ?: throw FlacDecoderException(
+                "FLAC codec configuration of ${raw.size} bytes contains no STREAMINFO",
+            )
         val channelCount = format.channelCount
         val sampleRateHz = format.sampleRate
         if (channelCount <= 0 || channelCount > MAX_CHANNELS) {
