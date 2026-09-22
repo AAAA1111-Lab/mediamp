@@ -51,29 +51,23 @@ constexpr jint kStreamInfoChannelsShift = 41;
 /**
  * Builds the bytes that precede one FLAC frame.
  *
- * `streamInfo` is the decoder configuration as Media3 reports it. Extractors differ in what they
- * put there: Matroska passes the raw 34-byte STREAMINFO block (Media3's MatroskaExtractor sets
- * `codecPrivate` straight through), while a native FLAC stream may pass the whole header. Both
- * shapes are accepted: anything already carrying the "fLaC" signature is used as is, and a bare
- * 34-byte STREAMINFO is wrapped in the signature and a STREAMINFO metadata block header.
+ * `streamInfo` is the decoder configuration as Media3 reports it, and every extractor that can
+ * produce an `audio/flac` track hands over the bare 34-byte STREAMINFO body:
+ *  - MatroskaExtractor forwards the Matroska `A_FLAC` CodecPrivate unchanged, and
+ *  - FlacExtractor consumes the "fLaC" signature and the metadata block header itself and keeps
+ *    only the STREAMINFO body.
  *
- * Returns false when the configuration cannot be interpreted, so the caller can fall back to a
- * hardware decoder instead of failing playback.
+ * So the prologue is always the signature plus one STREAMINFO metadata block header; there is no
+ * whole-header shape to deal with. Anything that is not exactly the expected size is rejected,
+ * which makes the renderer report an undecodable track instead of feeding dr_flac garbage.
  */
 bool buildPrologue(
     const uint8_t *streamInfo,
     size_t streamInfoSize,
     std::vector<uint8_t> &out
 ) {
-    if (streamInfo == nullptr || streamInfoSize < kStreamInfoSize) {
+    if (streamInfo == nullptr || streamInfoSize != kStreamInfoSize) {
         return false;
-    }
-
-    if (streamInfoSize >= kFlacSignatureSize &&
-        std::memcmp(streamInfo, "fLaC", kFlacSignatureSize) == 0) {
-        // Already a FLAC stream header; the frame appends directly after its metadata blocks.
-        out.assign(streamInfo, streamInfo + streamInfoSize);
-        return out.size() >= kWrappedHeaderSize;
     }
 
     out.resize(kWrappedHeaderSize);
@@ -174,17 +168,11 @@ Java_org_openani_mediamp_exoplayer_internal_FlacDecoderNative_nativeDecodeFrame(
         return -1;
     }
 
-    // A bare STREAMINFO arrives without the metadata block header, so the fields start at a
-    // different offset depending on which shape we got. Tracked while building the prologue.
-    const bool bareStreamInfo = wrapped.size() == kWrappedHeaderSize &&
-        std::memcmp(wrapped.data(), "fLaC", kFlacSignatureSize) == 0;
-    const uint8_t *streamInfoBody = bareStreamInfo
-        ? wrapped.data() + kFlacSignatureSize + kMetadataHeaderSize
-        : streamInfo.data() + (streamInfo.size() >= kWrappedHeaderSize
-            ? kFlacSignatureSize + kMetadataHeaderSize
-            : 0);
-
-    const StreamInfoFields fields = readStreamInfo(streamInfoBody);
+    // The prologue is always signature + metadata block header + the 34-byte STREAMINFO body,
+    // so the fields start at a fixed offset. Reading them from the wrapped copy keeps a single
+    // source of truth for the layout.
+    const StreamInfoFields fields =
+        readStreamInfo(wrapped.data() + kFlacSignatureSize + kMetadataHeaderSize);
     if (fields.channels == 0 || fields.channels > 8 || fields.maxBlockSize == 0) {
         return -1;
     }

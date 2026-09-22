@@ -55,9 +55,8 @@ internal class FlacDecoder private constructor(
     /**
      * Records the codec configuration and the output shape.
      *
-     * [configurationData] is what Media3 reports for the track: a bare 34-byte STREAMINFO block
-     * for Matroska extraction, or a full FLAC header. [FlacDecoderNative] accepts both, so the
-     * bytes are forwarded unchanged; only the format fields are read here.
+     * [configurationData] is the bare 34-byte STREAMINFO body Media3 reports for the track; see
+     * [FlacDecoderNative] for why that is the only shape that has to be handled.
      */
     fun configure(format: Format, configurationData: ByteArray?) {
         val data = configurationData

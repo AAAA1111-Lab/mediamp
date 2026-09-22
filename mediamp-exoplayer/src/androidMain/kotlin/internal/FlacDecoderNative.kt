@@ -29,9 +29,10 @@ internal object FlacDecoderNative {
     /**
      * Decodes one FLAC frame.
      *
-     * @param streamInfoBuffer the decoder configuration Media3 reports for the track. Either a
-     *   bare 34-byte STREAMINFO block (what Matroska extraction produces) or a full FLAC header
-     *   starting with `fLaC`; both are accepted.
+     * @param streamInfoBuffer the decoder configuration Media3 reports for the track: the bare
+     *   34-byte STREAMINFO body, which is what every extractor able to produce an `audio/flac`
+     *   track hands over (Matroska's `A_FLAC` CodecPrivate, and FlacExtractor after it consumes
+     *   the signature and block header itself).
      * @param frameBuffer one complete FLAC frame.
      * @param outputBuffer direct buffer to receive interleaved 32-bit PCM.
      * @return the number of PCM frames written, or a negative value when the frame is undecodable.
