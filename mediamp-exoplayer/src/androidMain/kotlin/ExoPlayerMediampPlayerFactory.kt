@@ -12,6 +12,7 @@ import android.content.Context
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.MediaSource
 import org.openani.mediamp.MediampPlayerFactory
 import org.openani.mediamp.source.MediaData
@@ -41,6 +42,10 @@ public class ExoPlayerMediampPlayerFactory : MediampPlayerFactory<ExoPlayerMedia
      * @param configurePlayerBuilder optional hook to customize the [ExoPlayer.Builder] (e.g.
      *   `setLoadControl` for buffering) right before the underlying [ExoPlayer] is built. See
      *   [ExoPlayerMediampPlayer] for details.
+     * @param mediaCodecSelector optional override for Media3's decoder selection, applied to the
+     *   renderers factory Mediamp builds. Use it to prefer a software decoder without losing
+     *   [ExoPlayerAudioTimeStretch.HighQualityWsola]. See [ExoPlayerMediampPlayer] for the
+     *   fallback contract an override must honour.
      */
     @OptIn(UnstableApi::class)
     public fun create(
@@ -49,6 +54,7 @@ public class ExoPlayerMediampPlayerFactory : MediampPlayerFactory<ExoPlayerMedia
         audioTimeStretch: ExoPlayerAudioTimeStretch = ExoPlayerAudioTimeStretch.Media3Default,
         mediaSourceInterceptor: ((MediaSource, MediaData) -> MediaSource)? = null,
         configurePlayerBuilder: ((ExoPlayer.Builder) -> Unit)? = null,
+        mediaCodecSelector: MediaCodecSelector? = null,
     ): ExoPlayerMediampPlayer {
         return ExoPlayerMediampPlayer(
             context,
@@ -56,6 +62,7 @@ public class ExoPlayerMediampPlayerFactory : MediampPlayerFactory<ExoPlayerMedia
             audioTimeStretch,
             mediaSourceInterceptor,
             configurePlayerBuilder,
+            mediaCodecSelector,
         )
     }
 

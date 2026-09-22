@@ -31,6 +31,7 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
@@ -135,6 +136,25 @@ import androidx.media3.common.Player as Media3Player
  *   Mediamp relies on its own track selector (subtitle selection through [MediaMetadata]) and,
  *   for [ExoPlayerAudioTimeStretch.HighQualityWsola], its own renderers factory; replacing
  *   either via `setTrackSelector`/`setRenderersFactory` disables the corresponding feature.
+ * @param mediaCodecSelector optional override for Media3's decoder selection, e.g.
+ *   [MediaCodecSelector.PREFER_SOFTWARE] to keep a broken hardware decoder out of the way.
+ *   It is applied to the renderers factory Mediamp builds, so it does **not** cancel
+ *   [ExoPlayerAudioTimeStretch.HighQualityWsola] — unlike calling `setRenderersFactory`
+ *   through [configurePlayerBuilder]. Passing `null` leaves Media3's default
+ *   ([MediaCodecSelector.DEFAULT]) untouched.
+ *
+ *   A selector is consulted only for `MediaCodec` decoding, so this hook cannot help a format
+ *   that the platform can only decode in hardware: preferring software has nothing to prefer
+ *   unless a software decoder is actually installed for that MIME type. A selector that returns
+ *   an empty list makes the renderer fail at init instead of falling back, so an override must
+ *   append the default candidates rather than replace them:
+ *   ```
+ *   mediaCodecSelector = { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+ *       MediaCodecSelector.PREFER_SOFTWARE
+ *           .getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
+ *           .ifEmpty { MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder) }
+ *   }
+ *   ```
  *
  * @see ExoPlayerMediampPlayerFactory
  */
@@ -146,6 +166,7 @@ public class ExoPlayerMediampPlayer @UiThread public constructor(
     audioTimeStretch: ExoPlayerAudioTimeStretch = ExoPlayerAudioTimeStretch.Media3Default,
     private val mediaSourceInterceptor: ((MediaSource, MediaData) -> MediaSource)? = null,
     configurePlayerBuilder: ((ExoPlayer.Builder) -> Unit)? = null,
+    private val mediaCodecSelector: MediaCodecSelector? = null,
 ) : AbstractMediampPlayer(
     parentCoroutineContext = parentCoroutineContext,
     mainDispatcher = Dispatchers.Main.immediate,
@@ -351,8 +372,11 @@ public class ExoPlayerMediampPlayer @UiThread public constructor(
     private val exoPlayer: ExoPlayer = ExoPlayer.Builder(context)
         .apply {
             setTrackSelector(trackSelector)
-            if (audioTimeStretch == ExoPlayerAudioTimeStretch.HighQualityWsola) {
-                val renderersFactory = WsolaRenderersFactory(context)
+            // Covers both time-stretch modes: with HighQualityWsola the factory also installs the
+            // WSOLA audio processor chain, otherwise it stays Media3's default besides the
+            // selector. Only build a factory when it actually differs from the default.
+            if (audioTimeStretch == ExoPlayerAudioTimeStretch.HighQualityWsola || mediaCodecSelector != null) {
+                val renderersFactory = WsolaRenderersFactory(context, mediaCodecSelector)
                 setRenderersFactory(renderersFactory)
             }
             // Last, so user configuration wins over the defaults above.

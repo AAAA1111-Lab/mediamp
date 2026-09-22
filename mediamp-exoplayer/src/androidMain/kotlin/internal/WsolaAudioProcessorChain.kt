@@ -19,6 +19,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 
 /**
  * Mirrors Media3's default `silence skipping -> Sonic` chain, replacing the Sonic slot with
@@ -63,10 +64,21 @@ internal class WsolaAudioProcessorChain : AudioProcessorChain {
 @OptIn(UnstableApi::class)
 internal class WsolaRenderersFactory(
     context: Context,
+    mediaCodecSelector: MediaCodecSelector? = null,
 ) : DefaultRenderersFactory(context) {
     /** The most recently installed chain, exposed for diagnostics and tests. */
     var audioProcessorChain: WsolaAudioProcessorChain? = null
         private set
+
+    init {
+        // Preferring a software decoder cannot fix a format whose only decoder is a broken
+        // hardware one unless the caller injects a selector that also falls back to the default
+        // list; a selector that simply returns empty makes the renderer fail at init. That is the
+        // caller's contract, see the ExoPlayerMediampPlayer constructor documentation.
+        if (mediaCodecSelector != null) {
+            setMediaCodecSelector(mediaCodecSelector)
+        }
+    }
 
     override fun buildAudioSink(
         context: Context,
