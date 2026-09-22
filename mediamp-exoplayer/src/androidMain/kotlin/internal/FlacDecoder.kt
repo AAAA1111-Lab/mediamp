@@ -147,52 +147,59 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
         input.get(inputScratch, 0, frameSize)
         accumulator.append(inputScratch, 0, frameSize)
 
-        while (true) {
-            val frame = accumulator.nextFrame() ?: break
-            if (frame.size > frameBuffer.capacity()) {
-                return FlacDecoderException("FLAC frame of ${frame.size} bytes exceeds the buffer")
+        val frame = accumulator.nextFrame()
+        if (frame == null) {
+            // No whole frame yet; the next container sample completes it.
+            //
+            // SimpleDecoder queues whatever output buffer it handed over unless the decoder marks
+            // it skipped, and a buffer whose data was never initialised fails later in the audio
+            // sink with a NullPointerException on that buffer. Marking it skipped makes Media3 drop
+            // it, which is exactly "this input produced nothing".
+            //
+            // The end-of-stream buffer is the exception: SimpleDecoder puts the end-of-stream flag
+            // on the output *before* decoding, and a skipped buffer is released instead of queued,
+            // so skipping there would swallow the end of the stream.
+            if (accumulator.bufferedBytes > MAX_BUFFERED_FRAME_BYTES) {
+                accumulator.reset()
+                return FlacDecoderException("FLAC frame exceeded $MAX_BUFFERED_FRAME_BYTES bytes")
             }
-            frameBuffer.clear()
-            frameBuffer.put(frame, 0, frame.size)
-            frameBuffer.position(0)
-            frameBuffer.limit(frame.size)
-
-            val capacity = outputBufferCapacity
-            val output = outputBuffer
-                .init(inputBuffer.timeUs, capacity)
-                .order(ByteOrder.nativeOrder())
-            val decodedFrames = try {
-                FlacDecoderNative.nativeDecodeFrame(
-                    streamInfoBuffer = infoBuffer,
-                    streamInfoSize = info.size,
-                    frameBuffer = frameBuffer,
-                    frameSize = frame.size,
-                    outputBuffer = output,
-                    outputCapacity = capacity,
-                )
-            } catch (error: Throwable) {
-                return FlacDecoderException("FLAC software decode failed", error)
+            if (!inputBuffer.isEndOfStream) {
+                outputBuffer.shouldBeSkipped = true
             }
-            if (decodedFrames <= 0) {
-                // The frame came from a container that handed over something this decoder cannot
-                // read. Fail rather than emit silence, so the failure stays visible.
-                return FlacDecoderException(
-                    "FLAC software decode produced no samples for a ${frame.size} byte frame",
-                )
-            }
-            output.position(0)
-            output.limit(decodedFrames * channels * BYTES_PER_SAMPLE)
-            // Only one output buffer per call is emitted, because Media3 pairs one input buffer
-            // with one output buffer; further whole frames stay in the accumulator.
             return null
         }
-        if (accumulator.bufferedBytes > MAX_BUFFERED_FRAME_BYTES) {
-            // A frame that never completes means the stream is not what we think it is. Reset so a
-            // later sample can resynchronise instead of growing without bound.
-            accumulator.reset()
-            return FlacDecoderException("FLAC frame exceeded ${MAX_BUFFERED_FRAME_BYTES} bytes")
+
+        if (frame.size > frameBuffer.capacity()) {
+            return FlacDecoderException("FLAC frame of ${frame.size} bytes exceeds the buffer")
         }
-        // No whole frame yet; the next container sample completes it.
+        frameBuffer.clear()
+        frameBuffer.put(frame, 0, frame.size)
+        frameBuffer.position(0)
+        frameBuffer.limit(frame.size)
+
+        val capacity = outputBufferCapacity
+        val output = outputBuffer.init(inputBuffer.timeUs, capacity).order(ByteOrder.nativeOrder())
+        val decodedFrames = try {
+            FlacDecoderNative.nativeDecodeFrame(
+                streamInfoBuffer = infoBuffer,
+                streamInfoSize = info.size,
+                frameBuffer = frameBuffer,
+                frameSize = frame.size,
+                outputBuffer = output,
+                outputCapacity = capacity,
+            )
+        } catch (error: Throwable) {
+            return FlacDecoderException("FLAC software decode failed", error)
+        }
+        if (decodedFrames <= 0) {
+            // The frame came from a container that handed over something this decoder cannot read.
+            // Fail rather than emit silence, so the failure stays visible.
+            return FlacDecoderException(
+                "FLAC software decode produced no samples for a ${frame.size} byte frame",
+            )
+        }
+        output.position(0)
+        output.limit(decodedFrames * channels * BYTES_PER_SAMPLE)
         return null
     }
 
