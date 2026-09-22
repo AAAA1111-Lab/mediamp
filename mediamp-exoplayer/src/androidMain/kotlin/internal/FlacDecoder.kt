@@ -112,7 +112,16 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
         DecoderInputBuffer(DecoderInputBuffer.BUFFER_REPLACEMENT_MODE_NORMAL)
 
     override fun createOutputBuffer(): SimpleDecoderOutputBuffer =
-        FlacDecoderOutputBuffer()
+        FlacDecoderOutputBuffer().also { it.decoder = this }
+
+    /**
+     * Returns a consumed buffer to this decoder's pool, called by [FlacDecoderOutputBuffer] through
+     * its owner. The parent method is protected, so this indirection is what makes the callback
+     * reachable from the buffer.
+     */
+    internal fun recycle(outputBuffer: FlacDecoderOutputBuffer) {
+        releaseOutputBuffer(outputBuffer)
+    }
 
     override fun createUnexpectedDecodeException(error: Throwable): FlacDecoderException =
         FlacDecoderException("Unexpected FLAC decode failure", error)
@@ -262,11 +271,34 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
     }
 }
 
-/** Releases the buffer back to its decoder, which is how Media3 recycles decoded PCM. */
-private class FlacDecoderOutputBuffer : SimpleDecoderOutputBuffer(Owner { it.release() })
+/**
+ * Releases the buffer back to its decoder, which is how Media3 recycles decoded PCM.
+ *
+ * The owner must call back into the decoder, not into the buffer: `release()` is what invokes the
+ * owner, so an owner that calls `release()` again recurses until the stack overflows — which is
+ * exactly how this crashed on device with a StackOverflowError.
+ *
+ * The decoder is injected by [FlacDecoder.createOutputBuffer], because the buffers are constructed
+ * before the decoder exists; a null target can only be observed before that injection.
+ */
+/**
+ * Releases the buffer back to its decoder, which is how Media3 recycles decoded PCM.
+ *
+ * The owner must call back into the decoder, not into the buffer: `release()` is what invokes the
+ * owner, so an owner that calls `release()` again recurses until the stack overflows — which is
+ * exactly how this crashed on device with a StackOverflowError.
+ *
+ * [decoder] is set by [FlacDecoder.createOutputBuffer], since the buffers are built during
+ * [SimpleDecoder]'s construction and cannot reach the decoder yet.
+ */
+internal class FlacDecoderOutputBuffer : SimpleDecoderOutputBuffer(
+    Owner<SimpleDecoderOutputBuffer> { buffer -> (buffer as FlacDecoderOutputBuffer).onReleased() },
+) {
+    var decoder: FlacDecoder? = null
 
-private fun interface Owner {
-    fun release(buffer: SimpleDecoderOutputBuffer)
+    internal fun onReleased() {
+        decoder?.recycle(this)
+    }
 }
 
 internal class FlacDecoderException : androidx.media3.decoder.DecoderException {
