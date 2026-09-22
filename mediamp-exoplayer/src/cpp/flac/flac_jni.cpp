@@ -104,27 +104,27 @@ StreamInfoFields readStreamInfo(const uint8_t *streamInfo) {
     return fields;
 }
 
-std::vector<uint8_t> copyBuffer(JNIEnv *env, jobject buffer, jint size) {
+/**
+ * Copies [size] bytes out of a direct ByteBuffer.
+ *
+ * Both buffers the Kotlin side passes are direct by construction: the codec configuration and the
+ * frame come from buffers allocated with `allocateDirect`, and the PCM target comes from
+ * `SimpleDecoderOutputBuffer.init`, which always returns a direct buffer. Anything else is a bug
+ * on the caller's side, so it yields an empty vector and the decode fails loudly.
+ */
+std::vector<uint8_t> copyDirectBuffer(JNIEnv *env, jobject buffer, jint size) {
     std::vector<uint8_t> result;
     if (buffer == nullptr || size <= 0) {
         return result;
     }
     auto *base = static_cast<uint8_t *>(env->GetDirectBufferAddress(buffer));
-    if (base != nullptr) {
-        result.assign(base, base + size);
+    if (base == nullptr) {
         return result;
     }
-    // A heap ByteBuffer cannot be addressed directly; copy through the array API.
-    auto *array = static_cast<jbyteArray>(env->NewByteArray(size));
-    if (array == nullptr) {
-        return result;
-    }
-    env->GetByteArrayRegion(reinterpret_cast<jbyteArray>(buffer), 0, size, array);
-    result.resize(static_cast<size_t>(size));
-    env->GetByteArrayRegion(array, 0, size, reinterpret_cast<jbyte *>(result.data()));
-    env->DeleteLocalRef(array);
+    result.assign(base, base + size);
     return result;
 }
+
 
 }  // namespace
 
@@ -157,8 +157,8 @@ Java_org_openani_mediamp_exoplayer_internal_FlacDecoderNative_nativeDecodeFrame(
         return -1;
     }
 
-    std::vector<uint8_t> streamInfo = copyBuffer(env, streamInfoBuffer, streamInfoSize);
-    std::vector<uint8_t> frame = copyBuffer(env, frameBuffer, frameSize);
+    std::vector<uint8_t> streamInfo = copyDirectBuffer(env, streamInfoBuffer, streamInfoSize);
+    std::vector<uint8_t> frame = copyDirectBuffer(env, frameBuffer, frameSize);
     if (frame.empty()) {
         return -1;
     }
