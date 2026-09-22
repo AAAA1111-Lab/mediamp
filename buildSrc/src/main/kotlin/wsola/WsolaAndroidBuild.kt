@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2024-2026 OpenAni and contributors.
  *
  * Use of this source code is governed by the Apache License version 2 license, which can be found at the following link.
@@ -114,13 +114,51 @@ abstract class PrepareWsolaAndroidJniLibsTask : DefaultTask() {
     }
 }
 
+/**
+ * The native libraries the ExoPlayer backend needs on Android.
+ *
+ * WSOLA is the time-stretch processor. FLAC is the bundled software FLAC decoder: MediaCodec has
+ * no extension point that could register a decoder, so owning the decode is the only way to play
+ * FLAC on a device whose platform decoder cannot handle 24-bit streams.
+ *
+ * Each entry is compiled from its own `src/cpp` subdirectory as one shared library, because the
+ * compile task passes every `.cpp` in that directory to a single clang++ invocation.
+ */
+private data class MediampNativeLibrary(
+    /** Directory under `src/cpp` holding the sources of this library. */
+    val sourceDir: String,
+    /** `lib<name>.so`. */
+    val libraryName: String,
+    val taskNameInfix: String,
+    val purpose: String,
+    /** Directory holding third-party headers, passed with `-isystem` so their warnings stay out. */
+    val thirdPartyIncludeDir: String?,
+)
+
+private val MEDIAMP_NATIVE_LIBRARIES = listOf(
+    MediampNativeLibrary(
+        sourceDir = "cpp",
+        libraryName = "mediamp_wsola",
+        taskNameInfix = "Wsola",
+        purpose = "WSOLA time-stretch",
+        thirdPartyIncludeDir = null,
+    ),
+    MediampNativeLibrary(
+        sourceDir = "cpp/flac",
+        libraryName = "mediamp_flac",
+        taskNameInfix = "Flac",
+        purpose = "FLAC software decoder",
+        thirdPartyIncludeDir = "cpp/flac/thirdparty",
+    ),
+)
+
 fun Project.configureWsolaAndroidBuild() {
     if (getPropertyOrNull("mediamp.exoplayer.wsola.skip")?.toBoolean() == true) {
-        logger.lifecycle("Skipping WSOLA native build: mediamp.exoplayer.wsola.skip=true")
+        logger.lifecycle("Skipping mediamp native builds: mediamp.exoplayer.wsola.skip=true")
         return
     }
     val ndkDir = runCatching { resolveNdkDir() }.getOrElse {
-        logger.warn("Android NDK not found – skipping WSOLA native build. Set ndk.dir or ANDROID_NDK_HOME to enable.")
+        logger.warn("Android NDK not found - skipping mediamp native builds. Set ndk.dir or ANDROID_NDK_HOME to enable.")
         return
     }
     val hostOs = getOs()
@@ -136,44 +174,51 @@ fun Project.configureWsolaAndroidBuild() {
     )
 
     val compileTasks = mutableListOf<TaskProvider<CompileWsolaLibraryTask>>()
-    abis.forEach { abi ->
-        val taskName = "compileWsola${abi.abi.replace("-", "")}"
-        compileTasks += tasks.register<CompileWsolaLibraryTask>(taskName) {
-            group = "mediamp"
-            description = "Compile libmediamp_wsola.so for Android ${abi.abi}"
-            val compilerSuffix = if (windowsHost) ".cmd" else ""
-            compiler.set(
-                llvmBinDir.resolve("${abi.clangTriple}${abi.apiLevel}-clang++$compilerSuffix"),
-            )
-            this.windowsHost.set(windowsHost)
-            compilerArgs.set(
-                listOf(
-                    "--sysroot=${sysroot.absolutePath}",
-                    "-std=c++17",
-                    "-O2",
-                    "-DNDEBUG",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    "-fPIC",
-                    "-shared",
-                    "-Wl,-z,max-page-size=16384",
-                    "-llog",
-                ),
-            )
-            sourceDir.set(layout.projectDirectory.dir("src/cpp"))
-            outputFile.set(
-                layout.buildDirectory.file("generated/wsola-jniLibs/${abi.abi}/libmediamp_wsola.so"),
-            )
+    MEDIAMP_NATIVE_LIBRARIES.forEach { library ->
+        abis.forEach { abi ->
+            val taskName = "compile${library.taskNameInfix}${abi.abi.replace("-", "")}"
+            compileTasks += tasks.register<CompileWsolaLibraryTask>(taskName) {
+                group = "mediamp"
+                description = "Compile lib${library.libraryName}.so (${library.purpose}) for Android ${abi.abi}"
+                val compilerSuffix = if (windowsHost) ".cmd" else ""
+                compiler.set(
+                    llvmBinDir.resolve("${abi.clangTriple}${abi.apiLevel}-clang++$compilerSuffix"),
+                )
+                this.windowsHost.set(windowsHost)
+                val includeArgs = library.thirdPartyIncludeDir?.let {
+                    listOf("-isystem", layout.projectDirectory.dir("src/$it").asFile.absolutePath)
+                }.orEmpty()
+                compilerArgs.set(
+                    listOf(
+                        "--sysroot=${sysroot.absolutePath}",
+                        "-std=c++17",
+                        "-O2",
+                        "-DNDEBUG",
+                        "-Wall",
+                        "-Wextra",
+                        "-Werror",
+                        "-fPIC",
+                        "-shared",
+                        "-Wl,-z,max-page-size=16384",
+                        "-llog",
+                    ) + includeArgs,
+                )
+                sourceDir.set(layout.projectDirectory.dir("src/${library.sourceDir}"))
+                outputFile.set(
+                    layout.buildDirectory.file(
+                        "generated/mediamp-jniLibs/${abi.abi}/lib${library.libraryName}.so",
+                    ),
+                )
+            }
         }
     }
 
     val prepareTask = tasks.register<PrepareWsolaAndroidJniLibsTask>("prepareWsolaAndroidJniLibs") {
         group = "mediamp"
-        description = "Prepare merged WSOLA jniLibs directory for Android variants"
+        description = "Prepare merged mediamp jniLibs directory for Android variants"
         dependsOn(compileTasks)
         inputFiles.from(compileTasks.map { it.flatMap(CompileWsolaLibraryTask::outputFile) })
-        outputDir.set(layout.buildDirectory.dir("generated/wsola-jniLibs-merged"))
+        outputDir.set(layout.buildDirectory.dir("generated/mediamp-jniLibs-merged"))
     }
 
     val androidComponents =

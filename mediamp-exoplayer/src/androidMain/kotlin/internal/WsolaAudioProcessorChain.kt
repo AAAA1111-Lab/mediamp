@@ -9,6 +9,7 @@
 package org.openani.mediamp.exoplayer.internal
 
 import android.content.Context
+import android.os.Handler
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.PlaybackParameters
@@ -16,6 +17,8 @@ import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.AudioProcessorChain
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
@@ -60,15 +63,39 @@ internal class WsolaAudioProcessorChain : AudioProcessorChain {
     override fun getSkippedOutputFrameCount(): Long = silenceSkippingAudioProcessor.skippedFrames
 }
 
-/** Installs [WsolaAudioProcessorChain] while keeping Media3's default renderers and audio sink. */
+/**
+ * The renderers factory Mediamp installs on its ExoPlayer.
+ *
+ * It exists for two reasons:
+ *  - it installs [WsolaAudioProcessorChain] on the audio sink, replacing Media3's default
+ *    Sonic-based time stretcher, and
+ *  - it adds [FlacAudioRenderer], the bundled FLAC software decoder, so FLAC does not have to go
+ *    through a platform decoder that may be unable to decode 24-bit streams.
+ *
+ * Both features share one audio sink on purpose: Media3 hands the renderers of a factory the same
+ * sink, and building it here keeps the WSOLA chain in effect for the software FLAC path too.
+ *
+ * [mediaCodecSelector] is forwarded to Media3 and only affects the platform path.
+ */
 @OptIn(UnstableApi::class)
 internal class WsolaRenderersFactory(
-    context: Context,
+    private val context: Context,
     mediaCodecSelector: MediaCodecSelector? = null,
 ) : DefaultRenderersFactory(context) {
     /** The most recently installed chain, exposed for diagnostics and tests. */
     var audioProcessorChain: WsolaAudioProcessorChain? = null
         private set
+
+    /** Built once and shared by every audio renderer; see the class comment. */
+    private val audioSink: AudioSink by lazy {
+        val chain = WsolaAudioProcessorChain().also { audioProcessorChain = it }
+        Log.i(TAG, "Installed WSOLA audio processor chain (fallback to Sonic if unavailable)")
+        DefaultAudioSink.Builder(context)
+            .setEnableFloatOutput(false)
+            .setEnableAudioOutputPlaybackParameters(true)
+            .setAudioProcessorChain(chain)
+            .build()
+    }
 
     init {
         // Preferring a software decoder cannot fix a format whose only decoder is a broken
@@ -80,21 +107,43 @@ internal class WsolaRenderersFactory(
         }
     }
 
+    override fun buildAudioRenderers(
+        context: Context,
+        extensionRendererMode: Int,
+        mediaCodecSelector: MediaCodecSelector,
+        enableDecoderFallback: Boolean,
+        audioSink: AudioSink,
+        eventHandler: Handler,
+        eventListener: AudioRendererEventListener,
+        out: ArrayList<Renderer>,
+    ) {
+        FlacAudioRenderer.addTo(
+            renderers = out,
+            context = context,
+            eventHandler = eventHandler,
+            eventListener = eventListener,
+            audioSink = audioSink,
+        )
+        super.buildAudioRenderers(
+            context,
+            extensionRendererMode,
+            mediaCodecSelector,
+            enableDecoderFallback,
+            audioSink,
+            eventHandler,
+            eventListener,
+            out,
+        )
+    }
+
     override fun buildAudioSink(
         context: Context,
         enableFloatOutput: Boolean,
-        enableAudioTrackPlaybackParams: Boolean
-    ): AudioSink {
-        val chain = WsolaAudioProcessorChain().also { audioProcessorChain = it }
-        Log.i(TAG, "Installed WSOLA audio processor chain (fallback to Sonic if unavailable)")
-        return DefaultAudioSink.Builder(context)
-            .setEnableFloatOutput(enableFloatOutput)
-            .setEnableAudioOutputPlaybackParameters(enableAudioTrackPlaybackParams)
-            .setAudioProcessorChain(chain)
-            .build()
-    }
+        enableAudioTrackPlaybackParams: Boolean,
+    ): AudioSink = audioSink
 
     private companion object {
         private const val TAG = "WsolaRenderersFactory"
     }
 }
+

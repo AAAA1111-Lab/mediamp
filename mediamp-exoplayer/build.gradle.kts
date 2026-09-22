@@ -36,6 +36,8 @@ kotlin {
             api(projects.mediampApi)
             implementation(libs.androidx.media3.exoplayer)
             implementation(libs.androidx.media3.ui)
+            // SimpleDecoder / Decoder, used by the bundled FLAC software audio renderer.
+            implementation(libs.androidx.media3.decoder)
         }
 
         androidHostTest.dependencies {
@@ -47,27 +49,31 @@ kotlin {
 
 configureWsolaAndroidBuild()
 
-val wsolaLicensePath =
-    "META-INF/licenses/org.openani.mediamp/mediamp-exoplayer/scaletempo2.txt"
+val bundledNativeLicenses = listOf(
+    "META-INF/licenses/org.openani.mediamp/mediamp-exoplayer/scaletempo2.txt",
+    "META-INF/licenses/org.openani.mediamp/mediamp-exoplayer/dr_flac.txt",
+)
 val verifyWsolaLicensePackaging by tasks.registering {
     group = "verification"
-    description = "Verifies that the Android AAR includes the scaletempo2 BSD license."
+    description = "Verifies that the Android AAR includes every bundled native license."
     dependsOn("bundleAndroidMainAar")
 
     val aar = layout.buildDirectory.file("outputs/aar/${project.name}.aar")
     inputs.file(aar)
+    inputs.property("bundledNativeLicenses", bundledNativeLicenses)
 
     doLast {
         ZipFile(aar.get().asFile).use { aarFile ->
             val classesJar = aarFile.getEntry("classes.jar")
                 ?: error("classes.jar is missing from ${aar.get().asFile}")
-            val licensePackaged = aarFile.getInputStream(classesJar).use { input ->
+            val packagedEntries = aarFile.getInputStream(classesJar).use { input ->
                 ZipInputStream(ByteArrayInputStream(input.readBytes())).use { classes ->
-                    generateSequence { classes.nextEntry }.any { it.name == wsolaLicensePath }
+                    generateSequence { classes.nextEntry }.map { it.name }.toHashSet()
                 }
             }
-            check(licensePackaged) {
-                "$wsolaLicensePath is missing from classes.jar in ${aar.get().asFile}"
+            val missing = bundledNativeLicenses.filterNot { it in packagedEntries }
+            check(missing.isEmpty()) {
+                "Missing licenses in classes.jar of ${aar.get().asFile}: $missing"
             }
         }
     }
