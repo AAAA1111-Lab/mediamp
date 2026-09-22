@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2024-2026 OpenAni and contributors.
  *
  * Use of this source code is governed by the Apache License version 2 license, which can be found at the following link.
@@ -35,6 +35,7 @@ import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import org.gradle.api.tasks.TaskProvider
 import org.gradle.kotlin.dsl.register
+import java.io.File
 
 
 /**
@@ -58,9 +59,16 @@ abstract class CompileWsolaLibraryTask : DefaultTask() {
     @get:Input
     abstract val windowsHost: Property<Boolean>
 
-    @get:InputDirectory
+    /**
+     * The `.cpp` files to compile, in a stable order.
+     *
+     * A file collection rather than a directory: the caller decides exactly what goes into one
+     * shared library, so a source directory that also holds other entry points (the FLAC probe
+     * has its own `main`) cannot accidentally contribute sources to a different binary.
+     */
+    @get:InputFiles
     @get:PathSensitive(PathSensitivity.RELATIVE)
-    abstract val sourceDir: DirectoryProperty
+    abstract val sources: ConfigurableFileCollection
 
     @get:OutputFile
     abstract val outputFile: RegularFileProperty
@@ -69,16 +77,15 @@ abstract class CompileWsolaLibraryTask : DefaultTask() {
     fun run() {
         val out = outputFile.get().asFile
         out.parentFile.mkdirs()
-        val sources = sourceDir.get().asFile.listFiles()
-            ?.filter { it.extension == "cpp" }
-            ?.sortedBy { it.name }
-            .orEmpty()
-        require(sources.isNotEmpty()) { "No .cpp sources in ${sourceDir.get().asFile}" }
+        val sourceFiles = sources.files
+            .filter { it.extension == "cpp" }
+            .sortedBy { it.name }
+        require(sourceFiles.isNotEmpty()) { "No .cpp sources configured for ${outputFile.get().asFile}" }
         val launcher = if (windowsHost.get()) listOf("cmd.exe", "/d", "/c") else emptyList()
         val command = launcher +
             compiler.get().asFile.absolutePath +
             compilerArgs.get() +
-            sources.map { it.absolutePath } +
+            sourceFiles.map { it.absolutePath } +
             listOf("-o", out.absolutePath)
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
@@ -87,7 +94,7 @@ abstract class CompileWsolaLibraryTask : DefaultTask() {
         val exitCode = process.waitFor()
         if (exitCode != 0) {
             throw GradleException(
-                "WSOLA compile failed (exit $exitCode): ${command.joinToString(" ")}\n$output",
+                "Native compile failed (exit $exitCode): ${command.joinToString(" ")}\n$output",
             )
         }
         logger.info(output)
@@ -125,30 +132,32 @@ abstract class PrepareWsolaAndroidJniLibsTask : DefaultTask() {
  * compile task passes every `.cpp` in that directory to a single clang++ invocation.
  */
 private data class MediampNativeLibrary(
-    /** Directory under `src/cpp` holding the sources of this library. */
-    val sourceDir: String,
+    /** Source files under `src/cpp`, relative to the module directory. */
+    val sources: List<String>,
     /** `lib<name>.so`. */
     val libraryName: String,
     val taskNameInfix: String,
     val purpose: String,
-    /** Directory holding third-party headers, passed with `-isystem` so their warnings stay out. */
-    val thirdPartyIncludeDir: String?,
+    /** Extra include directories, relative to the module directory. */
+    val includeDirs: List<String> = emptyList(),
+    /** Third-party include directories, passed with `-isystem` so their warnings stay out. */
+    val thirdPartyIncludeDirs: List<String> = emptyList(),
 )
 
 private val MEDIAMP_NATIVE_LIBRARIES = listOf(
     MediampNativeLibrary(
-        sourceDir = "cpp",
+        sources = listOf("cpp/scaletempo2.cpp", "cpp/wsola_jni.cpp"),
         libraryName = "mediamp_wsola",
         taskNameInfix = "Wsola",
         purpose = "WSOLA time-stretch",
-        thirdPartyIncludeDir = null,
     ),
     MediampNativeLibrary(
-        sourceDir = "cpp/flac",
+        sources = listOf("cpp/flac/flac_decode.cpp", "cpp/flac/flac_jni.cpp", "cpp/flac/dr_flac_impl.cpp"),
         libraryName = "mediamp_flac",
         taskNameInfix = "Flac",
         purpose = "FLAC software decoder",
-        thirdPartyIncludeDir = "cpp/flac/thirdparty",
+        includeDirs = listOf("cpp/flac"),
+        thirdPartyIncludeDirs = listOf("cpp/flac/thirdparty"),
     ),
 )
 
@@ -185,9 +194,13 @@ fun Project.configureWsolaAndroidBuild() {
                     llvmBinDir.resolve("${abi.clangTriple}${abi.apiLevel}-clang++$compilerSuffix"),
                 )
                 this.windowsHost.set(windowsHost)
-                val includeArgs = library.thirdPartyIncludeDir?.let {
-                    listOf("-isystem", layout.projectDirectory.dir("src/$it").asFile.absolutePath)
-                }.orEmpty()
+                val includeArgs =
+                    library.includeDirs.flatMap {
+                        listOf("-I", layout.projectDirectory.dir("src/$it").asFile.absolutePath)
+                    } +
+                        library.thirdPartyIncludeDirs.flatMap {
+                            listOf("-isystem", layout.projectDirectory.dir("src/$it").asFile.absolutePath)
+                        }
                 compilerArgs.set(
                     listOf(
                         "--sysroot=${sysroot.absolutePath}",
@@ -203,7 +216,7 @@ fun Project.configureWsolaAndroidBuild() {
                         "-llog",
                     ) + includeArgs,
                 )
-                sourceDir.set(layout.projectDirectory.dir("src/${library.sourceDir}"))
+                sources.from(library.sources.map { layout.projectDirectory.file("src/$it") })
                 outputFile.set(
                     layout.buildDirectory.file(
                         "generated/mediamp-jniLibs/${abi.abi}/lib${library.libraryName}.so",
@@ -228,5 +241,60 @@ fun Project.configureWsolaAndroidBuild() {
             prepareTask,
             PrepareWsolaAndroidJniLibsTask::outputDir,
         )
+    }
+
+    registerFlacProbeExecutable(ndkDir, hostTag, windowsHost, sysroot)
+}
+
+/**
+ * Builds `flac_probe`, a small Android executable that drives the FLAC decoder over a file on
+ * disk and reports which step fails.
+ *
+ * It exists because playback failures can only be attributed on a real device, while iterating
+ * through the app needs a rebuild, an install and UI driving. The probe links the same
+ * `mediamp_flac::decodeFrame` the renderer uses, so its verdict transfers directly.
+ *
+ * Not part of any shipped artifact; push it next to a FLAC file and run it over adb:
+ *
+ *   ./gradlew :mediamp-exoplayer:buildFlacProbe
+ *   adb push <build>/generated/flac-probe/flac_probe /data/local/tmp/
+ *   adb push sample.flac /data/local/tmp/
+ *   adb shell /data/local/tmp/flac_probe /data/local/tmp/sample.flac
+ */
+private fun Project.registerFlacProbeExecutable(
+    ndkDir: File,
+    hostTag: String,
+    windowsHost: Boolean,
+    sysroot: File,
+) {
+    val llvmBinDir = ndkDir.resolve("toolchains/llvm/prebuilt/$hostTag/bin")
+    val abi = DEFAULT_ANDROID_ABIS.first { it.abi == "arm64-v8a" }
+    tasks.register<CompileWsolaLibraryTask>("buildFlacProbe") {
+        group = "mediamp"
+        description = "Build the FLAC decoder probe executable for Android ${abi.abi}"
+        val compilerSuffix = if (windowsHost) ".cmd" else ""
+        compiler.set(llvmBinDir.resolve("${abi.clangTriple}${abi.apiLevel}-clang++$compilerSuffix"))
+        this.windowsHost.set(windowsHost)
+        compilerArgs.set(
+            listOf(
+                "--sysroot=${sysroot.absolutePath}",
+                "-std=c++17",
+                "-O1",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                // dr_flac is third-party; include it as a system header so its warnings stay out.
+                "-isystem",
+                layout.projectDirectory.dir("src/cpp/flac/thirdparty").asFile.absolutePath,
+                "-I",
+                layout.projectDirectory.dir("src/cpp/flac").asFile.absolutePath,
+            ),
+        )
+        sources.from(
+            layout.projectDirectory.file("src/cpp/flac/flac_decode.cpp"),
+            layout.projectDirectory.file("src/cpp/flac/dr_flac_impl.cpp"),
+            layout.projectDirectory.file("src/cpp/flac_probe/flac_probe.cpp"),
+        )
+        outputFile.set(layout.buildDirectory.file("generated/flac-probe/flac_probe"))
     }
 }
