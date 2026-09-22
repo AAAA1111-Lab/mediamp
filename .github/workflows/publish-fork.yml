@@ -1,0 +1,90 @@
+# Fork-only addition (not part of upstream mediamp).
+#
+# Publishes the library modules of this fork to GitHub Packages so that a consumer can depend on
+# fork builds without publishing to Maven Central.
+#
+# Why the explicit module list instead of `./gradlew publish`:
+#   `mediamp-ffmpeg` and `mediamp-mpv` also publish *native runtime* artifacts, which require
+#   MSYS2 on Windows and long per-architecture native builds. Android consumers never touch them.
+#   Without -Pmediamp.ffmpeg.buildvariant / -Pmediamp.mpv.buildvariant those targets are skipped,
+#   so the library POMs on GitHub Packages carry no dependency on a runtime artifact that was
+#   never published.
+#
+# The published version comes from `version.name` in gradle.properties (currently 0.5.0-fork1).
+name: Publish fork to GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '覆盖发布版本号 (留空则用 gradle.properties 的 version.name)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: 'Publish to GitHub Packages'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache Android SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/android-sdk
+          key: android-sdk-${{ runner.os }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: false
+
+      - name: Resolve version
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="$INPUT_VERSION"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(grep -E '^version\.name=' gradle.properties | cut -d'=' -f2 | tr -d ' \r\n')
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "Failed to determine the version to publish" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: $VERSION"
+
+      - name: Publish library modules
+        env:
+          ORG_GRADLE_PROJECT_githubPackagesUrl: https://maven.pkg.github.com/${{ github.repository }}
+          ORG_GRADLE_PROJECT_githubPackagesUsername: ${{ github.actor }}
+          ORG_GRADLE_PROJECT_githubPackagesPassword: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          ./gradlew \
+            -Pversion.name=${{ steps.meta.outputs.version }} \
+            -Pkotlin.native.ignoreDisabledTargets=true \
+            --no-configuration-cache \
+            --parallel \
+            :mediamp-api:publish \
+            :mediamp-exoplayer:publish \
+            :mediamp-source-ktxio:publish \
+            :mediamp-test:publish \
+            :mediamp-internal-utils:publish

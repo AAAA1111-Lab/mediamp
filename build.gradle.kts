@@ -6,6 +6,7 @@
  * https://github.com/open-ani/mediamp/blob/main/LICENSE
  */
 
+import org.gradle.api.publish.PublishingExtension
 import org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension
 import org.jetbrains.kotlin.gradle.dsl.kotlinExtension
 
@@ -42,6 +43,30 @@ allprojects {
         google()
         maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
         maven("https://androidx.dev/storage/compose-compiler/repository/")
+    }
+
+    // Fork-only: publish to GitHub Packages so a consumer can depend on fork builds without
+    // going through Maven Central. Inert unless the environment asks for it, so upstream builds
+    // and every local build are unaffected.
+    //
+    //   ORG_GRADLE_PROJECT_githubPackagesUrl=https://maven.pkg.github.com/<owner>/<repo>
+    //   ORG_GRADLE_PROJECT_githubPackagesUsername=<actor>
+    //   ORG_GRADLE_PROJECT_githubPackagesPassword=<token with write:packages>
+    //
+    plugins.withId("maven-publish") {
+        extensions.configure<PublishingExtension>("publishing") {
+            val url = providers.gradleProperty("githubPackagesUrl").orNull ?: return@configure
+            repositories {
+                maven {
+                    name = "GitHubPackages"
+                    setUrl(url)
+                    credentials {
+                        username = providers.gradleProperty("githubPackagesUsername").orNull
+                        password = providers.gradleProperty("githubPackagesPassword").orNull
+                    }
+                }
+            }
+        }
     }
 
     afterEvaluate {
