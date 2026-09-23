@@ -57,6 +57,15 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
      */
     private var frameBuffer: ByteBuffer = ByteBuffer.allocateDirect(FRAME_BUFFER_SIZE)
 
+    /**
+     * PCM staging for one decoded frame. Must stay direct: [FlacDecoderNative] reads it with
+     * `GetDirectBufferAddress`, which is null for a heap buffer.
+     */
+    private var pcmBuffer: ByteBuffer = ByteBuffer.allocateDirect(PCM_STAGING_BYTES)
+
+    /** Heap mirror of [pcmBuffer]'s usable region, used to assemble one container sample's PCM. */
+    private val pcmBytes = ByteArray(PCM_STAGING_BYTES)
+
     override fun getName(): String = "mediamp-flac"
 
     /**
@@ -165,8 +174,18 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
         // One input sample can complete more than one frame, and a frame left behind here would be
         // emitted later carrying the *next* sample's timestamp. Drain everything the accumulator
         // can produce and concatenate it into this sample's output.
+        //
+        // The native edge reads the PCM target with GetDirectBufferAddress, so that target must be a
+        // *direct* buffer. Wrapping a heap ByteArray makes the address null and every frame fails
+        // with "output is not direct" — which is exactly how this broke on device. `init` hands out
+        // a direct buffer, but only one frame fits per call, hence this reusable staging buffer.
+        val capacity = outputBufferCapacity
+        if (pcmBuffer.capacity() < capacity) {
+            pcmBuffer = ByteBuffer.allocateDirect(capacity).order(ByteOrder.nativeOrder())
+        }
+
         var decodedBytes: ByteArray? = null
-        var decodedFrames = 0
+        var totalBytes = 0
         while (true) {
             val frame = accumulator.nextFrame() ?: break
             if (frame.size > frameBuffer.capacity()) {
@@ -177,9 +196,12 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
             frameBuffer.position(0)
             frameBuffer.limit(frame.size)
 
-            val capacity = outputBufferCapacity
-            val pcm = ByteArray(capacity)
-            val pcmBuffer = ByteBuffer.wrap(pcm).order(ByteOrder.nativeOrder())
+            if (totalBytes + capacity > pcmBytes.size) {
+                return FlacDecoderException(
+                    "FLAC sample produced more than ${pcmBytes.size} bytes of PCM",
+                )
+            }
+            pcmBuffer.clear()
             val framesInThisFrame = try {
                 FlacDecoderNative.nativeDecodeFrame(
                     streamInfoBuffer = infoBuffer,
@@ -200,15 +222,25 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
                 )
             }
             val framesInThisFrameBytes = framesInThisFrame * channels * BYTES_PER_SAMPLE
-            decodedBytes = if (decodedBytes == null) {
-                pcm.copyOf(framesInThisFrameBytes)
+
+            val target = decodedBytes
+            if (target == null) {
+                decodedBytes = ByteArray(framesInThisFrameBytes).also {
+                    pcmBuffer.position(0)
+                    pcmBuffer.get(it, 0, framesInThisFrameBytes)
+                }
             } else {
-                decodedBytes + pcm.copyOf(framesInThisFrameBytes)
+                val grown = ByteArray(totalBytes + framesInThisFrameBytes)
+                target.copyInto(grown, 0, 0, totalBytes)
+                pcmBuffer.position(0)
+                pcmBuffer.get(grown, totalBytes, framesInThisFrameBytes)
+                decodedBytes = grown
             }
-            decodedFrames += framesInThisFrame
+            totalBytes += framesInThisFrameBytes
         }
 
-        if (decodedBytes == null) {
+        val decoded = decodedBytes
+        if (decoded == null) {
             // No whole frame yet; the next container sample completes it.
             //
             // SimpleDecoder queues whatever output buffer it handed over unless the decoder marks
@@ -229,10 +261,10 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
             return null
         }
 
-        val output = outputBuffer.init(inputBuffer.timeUs, decodedBytes.size).order(ByteOrder.nativeOrder())
-        output.put(decodedBytes, 0, decodedBytes.size)
+        val output = outputBuffer.init(inputBuffer.timeUs, decoded.size).order(ByteOrder.nativeOrder())
+        output.put(decoded, 0, decoded.size)
         output.position(0)
-        output.limit(decodedBytes.size)
+        output.limit(decoded.size)
         return null
     }
 
@@ -249,6 +281,13 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
         private const val BYTES_PER_SAMPLE = 4
         private const val MAX_CHANNELS = 8
         private const val OUTPUT_BUFFER_COUNT = 4
+
+        /**
+         * PCM staging size. One container sample can complete several frames, so this must hold more
+         * than a single [MAX_BLOCK_SIZE] worth; 8 channels of 32-bit PCM at the maximum block size
+         * is ~2 MiB, and a sample carrying more than that is refused rather than truncated.
+         */
+        private const val PCM_STAGING_BYTES = 8 * 1024 * 1024
 
         /**
          * Upper bound for a single frame. FLAC frames are at most a few tens of kilobytes; the
