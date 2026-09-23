@@ -51,9 +51,6 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
     /** Reassembles frames across container samples; see [FlacFrameAccumulator]. */
     private val accumulator = FlacFrameAccumulator()
 
-    /** Staging for the current container sample, reused so decoding does not allocate per sample. */
-    private var inputScratch = ByteArray(INPUT_SCRATCH_SIZE)
-
     /**
      * Staging for the frame handed to the native decoder: the JNI edge reads direct buffers, and
      * the accumulator produces plain arrays.
@@ -153,11 +150,65 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
 
         // A container sample is not a frame: it can hold a fragment of one or parts of several,
         // so collect bytes first and only hand whole frames to the native decoder.
-        input.get(inputScratch, 0, frameSize)
-        accumulator.append(inputScratch, 0, frameSize)
+        //
+        // The staging array is taken from the buffer instead of copying through a fixed scratch
+        // array: BUFFER_REPLACEMENT_MODE_NORMAL guarantees a backing array that always fits, while
+        // a fixed array silently throws BufferUnderflowException on any larger sample.
+        val sampleBytes = input.array()
+        if (sampleBytes == null) {
+            return FlacDecoderException("FLAC input buffer has no backing array")
+        }
+        val sampleOffset = input.arrayOffset() + input.position()
+        input.position(input.limit())
+        accumulator.append(sampleBytes, sampleOffset, frameSize)
 
-        val frame = accumulator.nextFrame()
-        if (frame == null) {
+        // One input sample can complete more than one frame, and a frame left behind here would be
+        // emitted later carrying the *next* sample's timestamp. Drain everything the accumulator
+        // can produce and concatenate it into this sample's output.
+        var decodedBytes: ByteArray? = null
+        var decodedFrames = 0
+        while (true) {
+            val frame = accumulator.nextFrame() ?: break
+            if (frame.size > frameBuffer.capacity()) {
+                return FlacDecoderException("FLAC frame of ${frame.size} bytes exceeds the buffer")
+            }
+            frameBuffer.clear()
+            frameBuffer.put(frame, 0, frame.size)
+            frameBuffer.position(0)
+            frameBuffer.limit(frame.size)
+
+            val capacity = outputBufferCapacity
+            val pcm = ByteArray(capacity)
+            val pcmBuffer = ByteBuffer.wrap(pcm).order(ByteOrder.nativeOrder())
+            val framesInThisFrame = try {
+                FlacDecoderNative.nativeDecodeFrame(
+                    streamInfoBuffer = infoBuffer,
+                    streamInfoSize = info.size,
+                    frameBuffer = frameBuffer,
+                    frameSize = frame.size,
+                    outputBuffer = pcmBuffer,
+                    outputCapacity = capacity,
+                )
+            } catch (error: Throwable) {
+                return FlacDecoderException("FLAC software decode failed", error)
+            }
+            if (framesInThisFrame <= 0) {
+                // The frame came from a container that handed over something this decoder cannot
+                // read. Fail rather than emit silence, so the failure stays visible.
+                return FlacDecoderException(
+                    "FLAC software decode produced no samples for a ${frame.size} byte frame",
+                )
+            }
+            val framesInThisFrameBytes = framesInThisFrame * channels * BYTES_PER_SAMPLE
+            decodedBytes = if (decodedBytes == null) {
+                pcm.copyOf(framesInThisFrameBytes)
+            } else {
+                decodedBytes + pcm.copyOf(framesInThisFrameBytes)
+            }
+            decodedFrames += framesInThisFrame
+        }
+
+        if (decodedBytes == null) {
             // No whole frame yet; the next container sample completes it.
             //
             // SimpleDecoder queues whatever output buffer it handed over unless the decoder marks
@@ -178,37 +229,10 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
             return null
         }
 
-        if (frame.size > frameBuffer.capacity()) {
-            return FlacDecoderException("FLAC frame of ${frame.size} bytes exceeds the buffer")
-        }
-        frameBuffer.clear()
-        frameBuffer.put(frame, 0, frame.size)
-        frameBuffer.position(0)
-        frameBuffer.limit(frame.size)
-
-        val capacity = outputBufferCapacity
-        val output = outputBuffer.init(inputBuffer.timeUs, capacity).order(ByteOrder.nativeOrder())
-        val decodedFrames = try {
-            FlacDecoderNative.nativeDecodeFrame(
-                streamInfoBuffer = infoBuffer,
-                streamInfoSize = info.size,
-                frameBuffer = frameBuffer,
-                frameSize = frame.size,
-                outputBuffer = output,
-                outputCapacity = capacity,
-            )
-        } catch (error: Throwable) {
-            return FlacDecoderException("FLAC software decode failed", error)
-        }
-        if (decodedFrames <= 0) {
-            // The frame came from a container that handed over something this decoder cannot read.
-            // Fail rather than emit silence, so the failure stays visible.
-            return FlacDecoderException(
-                "FLAC software decode produced no samples for a ${frame.size} byte frame",
-            )
-        }
+        val output = outputBuffer.init(inputBuffer.timeUs, decodedBytes.size).order(ByteOrder.nativeOrder())
+        output.put(decodedBytes, 0, decodedBytes.size)
         output.position(0)
-        output.limit(decodedFrames * channels * BYTES_PER_SAMPLE)
+        output.limit(decodedBytes.size)
         return null
     }
 
@@ -225,7 +249,6 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
         private const val BYTES_PER_SAMPLE = 4
         private const val MAX_CHANNELS = 8
         private const val OUTPUT_BUFFER_COUNT = 4
-        private const val INPUT_SCRATCH_SIZE = 128 * 1024
 
         /**
          * Upper bound for a single frame. FLAC frames are at most a few tens of kilobytes; the
