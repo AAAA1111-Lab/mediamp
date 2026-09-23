@@ -24,9 +24,9 @@ plugins {
 include(":mediamp-internal-utils")
 include(":mediamp-api")
 
-// A consumer that composes these modules from source (see the `consumer` note in the README of
-// this fork) switches this on. It then gets only the library modules it can link, because the rest
-// cannot be configured on every host:
+// A consumer that composes these modules from source switches this on by committing an empty
+// `consumer-only` marker file next to this settings file. It then gets only the library modules it
+// can link, because the rest cannot be configured on every host:
 //   - `mediamp-ffmpeg` resolves an MSYS2 installation at configuration time, so it fails outright
 //     on a Windows host;
 //   - `mediamp-mpv` and `mediamp-native-loader` are the native runtime machinery, which needs
@@ -35,11 +35,12 @@ include(":mediamp-api")
 // Publishing the fork is unaffected either way: the workflow names the modules it publishes
 // explicitly.
 //
-// The switch is read from the command line property and from a system property, because a Gradle
-// property set on the including build is not reliably visible to an included build, while a system
-// property set before `includeBuild` is.
-val consumerOnly = providers.gradleProperty("mediamp.consumer").orNull?.toBoolean() == true ||
-    System.getProperty("mediamp.consumer")?.toBoolean() == true
+// A marker file rather than a property: when this build is composed via `includeBuild`, Gradle
+// gives the included build its own instance and neither `-P` nor system properties set by the
+// including build arrive reliably (verified - `System.getProperty` read null there). A file is
+// simply present, which also means a plain `submodules: recursive` checkout needs no extra CI
+// wiring.
+val consumerOnly = file("consumer-only").isFile
 
 if (!consumerOnly) {
     //include(":mediamp-vlc") // deprecated
