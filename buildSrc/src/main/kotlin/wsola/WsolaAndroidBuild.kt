@@ -110,13 +110,17 @@ abstract class PrepareWsolaAndroidJniLibsTask : DefaultTask() {
 
     @TaskAction
     fun run() {
-        project.sync {
-            inputFiles.files.sortedBy { it.parentFile.name }.forEach { library ->
-                from(library) {
-                    into(library.parentFile.name)
-                }
-            }
-            into(outputDir)
+        // Copies the built libraries into one directory per ABI, laid out the way jniLibs expects.
+        //
+        // Not `project.sync`: a task may not touch `project` at execution time, and consumers that
+        // enable Gradle's configuration cache (the Ani app does) fail the build when it does.
+        val target = outputDir.get().asFile
+        target.deleteRecursively()
+        target.mkdirs()
+        inputFiles.files.sortedBy { it.parentFile.name }.forEach { library ->
+            val abiDir = File(target, library.parentFile.name)
+            abiDir.mkdirs()
+            library.copyTo(File(abiDir, library.name), overwrite = true)
         }
     }
 }
