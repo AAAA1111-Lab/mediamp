@@ -188,6 +188,12 @@ internal class FlacDecoder private constructor() : SimpleDecoder<DecoderInputBuf
         var totalBytes = 0
         while (true) {
             val frame = accumulator.nextFrame() ?: break
+            if (frame.isEmpty()) {
+                // The accumulator dropped a partial frame while re-aligning after a seek. Skip the
+                // fragment: decoding it would fail the whole track, and after a seek losing a few
+                // milliseconds is far better than stopping playback.
+                continue
+            }
             if (frame.size > frameBuffer.capacity()) {
                 return FlacDecoderException("FLAC frame of ${frame.size} bytes exceeds the buffer")
             }

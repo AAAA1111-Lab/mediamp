@@ -100,6 +100,9 @@ class FlacFrameAccumulatorTest {
         accumulator.append(payload, 0, payload.size)
         accumulator.endOfInput()
 
+        // The garbage is reported as discarded — never handed out as a frame — and the real frame
+        // follows intact.
+        assertTrue(accumulator.nextFrame()!!.isEmpty())
         assertContentEquals(frame, accumulator.nextFrame())
     }
 
@@ -128,13 +131,70 @@ class FlacFrameAccumulatorTest {
         val accumulator = FlacFrameAccumulator()
         accumulator.append(stream, 0, stream.size)
 
-        // The real frame ends where the fake header begins, so it is emitted as soon as the fake
-        // header's presence makes the frame's end known... which it must not, because the fake
-        // header fails validation and therefore cannot bound the frame.
+        // `fake` does not start with a valid header, so it cannot bound the frame either.
         assertNull(accumulator.nextFrame())
 
         accumulator.endOfInput()
         assertContentEquals(stream, accumulator.nextFrame())
+    }
+
+    /**
+     * The regression that stopped playback after a seek (auto-skip OP/ED, scrubbing).
+     *
+     * A seek rejoins the stream mid-frame. Re-aligning finds the next sync code, and a sync code
+     * inside the compressed subframes that also carries a valid header CRC-8 is indistinguishable
+     * from a header by that check alone — so it was accepted as a boundary, the frame was truncated,
+     * and dr_flac produced no PCM, which failed the whole track on device.
+     *
+     * The preceding frame's CRC-16 rules it out. This pins the observable consequence: the frame is
+     * never cut short at the false sync. Before the CRC-16 check the emitted frame ended *at* the
+     * false sync, i.e. well short of the whole damaged region.
+     */
+    @Test
+    fun `a false sync with a valid header CRC does not truncate the frame`() {
+        val frame = buildFrame(blockSize = 64)
+        val headerSize = frame.size - SUBFRAME_SIZE * CHANNELS - FOOTER_SIZE
+        assertEquals(HEADER_SIZE, headerSize, "fixture header size must match the parser's view")
+
+        val fake = falseSyncSequence()
+        // The fixture must reproduce the failure mode: a sync code whose own header CRC-8 agrees.
+        assertEquals(0, crc8(fake, 0, fake.size - 1) - (fake[fake.size - 1].toInt() and 0xFF))
+
+        // Put the false sync inside the frame's body, after the first subframe.
+        val insertAt = headerSize + SUBFRAME_SIZE
+        val damaged = frame.copyOfRange(0, insertAt) + fake + frame.copyOfRange(insertAt, frame.size)
+
+        val accumulator = FlacFrameAccumulator()
+        accumulator.append(damaged, 0, damaged.size)
+        accumulator.append(frame, 0, frame.size)
+
+        val reported = generateSequence { accumulator.nextFrame() }.toMutableList()
+        accumulator.endOfInput()
+        generateSequence { accumulator.nextFrame() }.forEach { reported += it }
+
+        assertTrue(reported.isNotEmpty(), "no frame was produced at all")
+        assertTrue(
+            reported.none { it.size < damaged.size },
+            "output was truncated at the false sync: ${reported.map { it.size }}",
+        )
+    }
+
+    /**
+     * Before a seek the accumulator may already hold the tail of a frame it never saw the start of.
+     * Those bytes are not decodable and must be reported as discarded, never emitted as a frame.
+     */
+    @Test
+    fun `a mid-frame remainder is discarded rather than emitted`() {
+        val frame = buildFrame(blockSize = 32)
+        val accumulator = FlacFrameAccumulator()
+
+        // The last two thirds of a frame, as after a seek into the middle of it.
+        val tail = frame.copyOfRange(frame.size / 3, frame.size)
+        accumulator.append(tail, 0, tail.size)
+        accumulator.endOfInput()
+
+        val first = accumulator.nextFrame()
+        assertTrue(first == null || first.isEmpty(), "a frame tail was emitted as a frame")
     }
 
     private fun drainInChunks(
@@ -157,20 +217,24 @@ class FlacFrameAccumulatorTest {
         val frames = mutableListOf<ByteArray>()
         while (true) {
             val frame = accumulator.nextFrame() ?: break
-            frames.add(frame)
+            // An empty array is the accumulator's "discarded bytes" sentinel, not a frame.
+            if (frame.isNotEmpty()) {
+                frames.add(frame)
+            }
         }
         return frames
     }
 
     /**
-     * A frame with two constant subframes per channel, which is the smallest legal FLAC frame:
-     * `FF F8`, block size code 0x6 (8-bit block size follows) with sample rate code 9 (44.1 kHz
-     * from STREAMINFO), channel assignment 0b0001 with sample size code 0b100 (16 bit), a one-byte
-     * frame number, the stored 8-bit block size, the header CRC-8, then per channel a `00000010`
-     * constant subframe header with one sample, and the frame CRC-8.
+     * A complete, structurally valid frame: `FF F8`, block size code 0x6 (8-bit block size follows)
+     * with sample rate code 9 (44.1 kHz from STREAMINFO), channel assignment 0b0001 with sample size
+     * code 0b100 (16 bit), a one-byte frame number, the stored 8-bit block size, the header CRC-8,
+     * then per channel a `00000010` constant subframe header with one constant sample, and finally
+     * the frame CRC-16 over everything before it.
      *
-     * The header CRC has to be genuine, because the accumulator uses it to tell a real frame header
-     * apart from the sync bytes that occur inside compressed subframes.
+     * Both checksums are genuine. The accumulator recognises a header by its CRC-8, but confirms a
+     * *boundary* by the preceding frame's CRC-16, so a fake of either would make these fixtures test
+     * the wrong thing.
      */
     private fun buildFrame(blockSize: Int): ByteArray {
         val header = byteArrayOf(
@@ -181,9 +245,28 @@ class FlacFrameAccumulatorTest {
             0x00, // one-byte frame number
             (blockSize - 1).toByte(),
         )
-        val headerCrc = crc8(header, 0, header.size)
-        val subframe = byteArrayOf(0x02, 0x00, 0x00)
-        return header + byteArrayOf(headerCrc.toByte()) + subframe + subframe + byteArrayOf(0x00)
+        val body = header + byteArrayOf(crc8(header, 0, header.size).toByte()) + subframe() + subframe()
+        return body + crc16(body, 0, body.size).toBigEndianBytes()
+    }
+
+    /** One channel's constant subframe holding a single sample. */
+    private fun subframe(): ByteArray = byteArrayOf(0x02, 0x00, 0x00)
+
+    /**
+     * A sync code plus a header whose own CRC-8 is valid — structurally indistinguishable from a
+     * real frame header. Placed inside a frame's body it must NOT be accepted as a boundary, because
+     * the preceding frame's CRC-16 will not agree with the bytes in between.
+     */
+    private fun falseSyncSequence(): ByteArray {
+        val header = byteArrayOf(
+            0xFF.toByte(),
+            0xF8.toByte(),
+            0x69,
+            0x18,
+            0x00,
+            0x3F,
+        )
+        return header + byteArrayOf(crc8(header, 0, header.size).toByte())
     }
 
     /** CRC-8 with polynomial x^8 + x^2 + x + 1, as FLAC uses for frame headers. */
@@ -196,5 +279,29 @@ class FlacFrameAccumulatorTest {
             }
         }
         return crc
+    }
+
+    /** CRC-16 with polynomial x^16 + x^15 + x^2 + 1, as FLAC uses for the frame footer. */
+    private fun crc16(bytes: ByteArray, from: Int, until: Int): Int {
+        var crc = 0
+        for (index in from until until) {
+            crc = crc xor ((bytes[index].toInt() and 0xFF) shl 8)
+            repeat(8) {
+                crc = if ((crc and 0x8000) != 0) ((crc shl 1) xor 0x8005) and 0xFFFF else (crc shl 1) and 0xFFFF
+            }
+        }
+        return crc
+    }
+
+    private fun Int.toBigEndianBytes(): ByteArray =
+        byteArrayOf(((this shr 8) and 0xFF).toByte(), (this and 0xFF).toByte())
+
+    private companion object {
+        const val CHANNELS = 2
+        const val SUBFRAME_SIZE = 3
+        const val FOOTER_SIZE = 2
+
+        /** Sync(2) + block size/rate(1) + channel/size(1) + number(1) + size(1) + CRC(1). */
+        const val HEADER_SIZE = 7
     }
 }

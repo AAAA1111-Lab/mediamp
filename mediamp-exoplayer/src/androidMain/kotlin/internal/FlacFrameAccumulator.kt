@@ -62,6 +62,11 @@ internal class FlacFrameAccumulator(initialCapacity: Int = 64 * 1024) {
     /**
      * Removes and returns the next complete frame, or null when what is buffered does not yet hold
      * one. The returned array is a copy, so it stays valid while the caller decodes it.
+     *
+     * A non-null **empty** array means bytes were discarded without producing a frame. That happens
+     * when the buffer does not start on a frame header (the stream was rejoined mid-frame by a seek)
+     * and re-aligning it means throwing the partial frame away. The caller must not treat an empty
+     * array as audio; it exists so the caller can distinguish "discarded" from "not enough data yet".
      */
     fun nextFrame(): ByteArray? {
         if (size < MIN_HEADER_SIZE) {
@@ -76,11 +81,19 @@ internal class FlacFrameAccumulator(initialCapacity: Int = 64 * 1024) {
                 return null
             }
             discardPrefix(nextStart)
-            if (size < MIN_HEADER_SIZE) return null
+            // Report the discard so the caller does not silently lose a sample's worth of time.
+            return EMPTY_FRAME
         }
 
         val headerSize = parseHeaderSize(buffer, 0, size) ?: return null
         val frameLength = findFrameLength(buffer, size, headerSize, endOfInput) ?: return null
+        if (frameLength <= headerSize + FOOTER_SIZE) {
+            // No candidate verified against this frame's CRC-16. The bytes are not decodable as a
+            // frame; drop the header and re-align rather than handing garbage to the decoder, which
+            // would fail the whole track. Only possible mid-stream, where a real boundary is pending.
+            discardPrefix(headerSize)
+            return EMPTY_FRAME
+        }
         val frame = buffer.copyOfRange(0, frameLength)
         discardPrefix(frameLength)
         return frame
@@ -109,6 +122,16 @@ internal class FlacFrameAccumulator(initialCapacity: Int = 64 * 1024) {
     private companion object {
         const val MIN_HEADER_SIZE = 6
         const val MAX_HEADER_SIZE = 16
+
+        /** FLAC stores a 16-bit CRC of the frame in its last two bytes (RFC 9639 §9.3). */
+        const val FOOTER_SIZE = 2
+
+        /**
+         * Sentinel returned by [nextFrame] to mean "bytes were discarded, no frame produced".
+         * Compared by identity, never by content.
+         */
+        val EMPTY_FRAME = ByteArray(0)
+
         const val SYNC_FIRST = 0xFF
         const val SYNC_SECOND_MASK = 0xFE
         const val SYNC_SECOND_VALUE = 0xF8
@@ -135,6 +158,34 @@ internal class FlacFrameAccumulator(initialCapacity: Int = 64 * 1024) {
             var crc = 0
             for (index in from until until) {
                 crc = CRC8_TABLE[(crc xor (bytes[index].toInt() and 0xFF)) and 0xFF]
+            }
+            return crc
+        }
+
+        /**
+         * CRC-16 with the polynomial x^16 + x^15 + x^2 + 1, which FLAC uses for the frame footer
+         * (RFC 9639 §9.3). Initial value 0, no reflection, no final XOR.
+         *
+         * This is the authoritative frame boundary check. The header's CRC-8 is only 8 bits, so a
+         * sync code inside a frame's compressed subframes passes it roughly once every 256 tries;
+         * accepting one truncates the frame and `dr_flac` then produces no PCM. That is what crashed
+         * playback after a seek on device (auto-skip and scrubbing), where the stream is rejoined
+         * mid-frame.
+         */
+        val CRC16_TABLE = IntArray(256).also { table ->
+            for (index in 0 until 256) {
+                var crc = index shl 8
+                repeat(8) {
+                    crc = if ((crc and 0x8000) != 0) ((crc shl 1) xor 0x8005) and 0xFFFF else (crc shl 1) and 0xFFFF
+                }
+                table[index] = crc
+            }
+        }
+
+        fun crc16(bytes: ByteArray, from: Int, until: Int): Int {
+            var crc = 0
+            for (index in from until until) {
+                crc = ((crc shl 8) xor CRC16_TABLE[((crc shr 8) xor (bytes[index].toInt() and 0xFF)) and 0xFF]) and 0xFFFF
             }
             return crc
         }
@@ -236,13 +287,17 @@ internal class FlacFrameAccumulator(initialCapacity: Int = 64 * 1024) {
         }
 
         /**
-         * Length of the frame that starts at [offset], found by locating the next header.
+         * Length of the frame that starts at [offset], found by locating the next header whose
+         * preceding frame CRC-16 agrees.
          *
-         * No lower bound beyond the header is applied: the block size is a sample count, not a
-         * byte count, and a block whose samples are all equal compresses to a handful of bytes.
-         * Candidates are therefore accepted purely on a structurally valid header, which the
-         * 14-bit sync plus the reserved bit plus a consistent header length make unlikely to
-         * occur inside compressed data by chance.
+         * No lower bound beyond the header plus the footer is applied: the block size is a sample
+         * count, not a byte count, and a block whose samples are all equal compresses to a handful
+         * of bytes.
+         *
+         * The CRC over the candidate span is recomputed rather than maintained incrementally. That
+         * costs a pass over the frame per candidate, but [isHeaderStart] rejects almost every
+         * position first, so in practice this is one pass per frame — and recomputing is the version
+         * whose correctness is actually pinned by the tests.
          */
         fun findFrameLength(
             bytes: ByteArray,
@@ -250,13 +305,21 @@ internal class FlacFrameAccumulator(initialCapacity: Int = 64 * 1024) {
             headerSize: Int,
             endOfInput: Boolean,
         ): Int? {
-            var candidate = headerSize + 1
+            var candidate = headerSize + FOOTER_SIZE
             while (candidate + MIN_HEADER_SIZE <= available) {
                 if (isHeaderStart(bytes, candidate) &&
                     parseHeaderSize(bytes, candidate, available) != null
                 ) {
-                    return candidate
+                    val stored = ((bytes[candidate - 2].toInt() and 0xFF) shl 8) or
+                            (bytes[candidate - 1].toInt() and 0xFF)
+                    if (crc16(bytes, 0, candidate - FOOTER_SIZE) == stored) {
+                        return candidate
+                    }
                 }
+                // A rejected candidate is a false sync inside the frame: the two bytes before a real
+                // boundary are the frame's stored CRC-16, which a correctly built frame always
+                // matches. So the real boundary can only lie further on and scanning forward never
+                // skips it.
                 candidate += 1
             }
             // No next frame header yet. Only when no more bytes can arrive is what is buffered the
